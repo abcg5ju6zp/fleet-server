@@ -25,6 +25,7 @@ func (b *Bulker) ReadRaw(ctx context.Context, index, id string, opts ...Opt) (*M
 	span, ctx := apm.StartSpan(ctx, bulkSpanNames[ActionRead], "bulker")
 	defer span.End()
 	opt := b.parseOpts(opts...)
+	opt.trafficClass = resolveClass(ctx, opt)
 	if tx := apm.TransactionFromContext(ctx); tx != nil {
 		tCtx := tx.TraceContext()
 		opt.spanLink = apm.SpanLink{Trace: tCtx.Trace, Span: tCtx.Span}

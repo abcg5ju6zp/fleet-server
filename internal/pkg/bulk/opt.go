@@ -5,6 +5,7 @@
 package bulk
 
 import (
+	"context"
 	"strconv"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/build"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
+	"github.com/elastic/fleet-server/v7/internal/pkg/traffic"
 )
 
 //-----
@@ -28,6 +30,8 @@ type optionsT struct {
 	hasSpanLink        bool
 	DedupeKey          string
 	RefreshIndex       string
+	trafficClassSet    bool
+	trafficClass       traffic.Class
 }
 
 type Opt func(*optionsT)
@@ -75,6 +79,25 @@ func WithDedupeKey(key, refreshIndex string) Opt {
 	}
 }
 
+// WithTrafficClass explicitly tags the ES work caused by an operation.
+// Without it, the class is inherited from the caller context, defaulting to
+// control. The tag rides on the bulk block through batching and ES retries.
+func WithTrafficClass(c traffic.Class) Opt {
+	return func(opt *optionsT) {
+		opt.trafficClassSet = true
+		opt.trafficClass = c
+	}
+}
+
+// resolveClass picks the explicit option class when set, otherwise inherits
+// the class from ctx (default control).
+func resolveClass(ctx context.Context, opt optionsT) traffic.Class {
+	if opt.trafficClassSet {
+		return opt.trafficClass
+	}
+	return traffic.FromContext(ctx)
+}
+
 //-----
 // Bulk API options
 
@@ -92,6 +115,9 @@ type bulkOptT struct {
 	bi                       build.Info
 	enrollFlushInterval      time.Duration
 	enrollFlushThresholdCnt  int
+	trafficGate              *traffic.Gate
+	bgDispatchLimit          int64
+	bgFlushDelay             time.Duration
 }
 
 type BulkOpt func(*bulkOptT)
@@ -185,6 +211,20 @@ func WithEnrollFlushInterval(d time.Duration) BulkOpt {
 // of the kQueueEnrollSearch queue.
 func WithEnrollFlushThresholdCount(cnt int) BulkOpt {
 	return func(opt *bulkOptT) { opt.enrollFlushThresholdCnt = cnt }
+}
+
+// WithTrafficScheduling enables class-aware flush scheduling. The gate owns
+// the atomic capacity rules (Apply swaps snapshots at runtime); background
+// dispatchLimit rejects background dispatches above the cap (0 falls back to
+// maxPendingBulkDispatches semantics), and backgroundFlushDelay bounds how
+// long a background-only queue may be deferred before it is flushed even
+// while control work is ahead.
+func WithTrafficScheduling(gate *traffic.Gate, backgroundDispatchLimit int64, backgroundFlushDelay time.Duration) BulkOpt {
+	return func(opt *bulkOptT) {
+		opt.trafficGate = gate
+		opt.bgDispatchLimit = backgroundDispatchLimit
+		opt.bgFlushDelay = backgroundFlushDelay
+	}
 }
 
 func parseBulkOpts(opts ...BulkOpt) bulkOptT {

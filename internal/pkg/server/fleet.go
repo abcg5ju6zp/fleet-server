@@ -9,9 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"reflect"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.elastic.co/apm/v2"
@@ -58,6 +58,22 @@ type Fleet struct {
 	cfg *config.Config
 
 	checkinT *api.CheckinT
+
+	// traffic gates survive server restarts so traffic_priority reloads
+	// are applied atomically without restarting subsystems.
+	traffic *trafficGates
+
+	// bulkerPtr is read by reload/status goroutines and atomically swapped
+	// on every (re)start of runServer.
+	bulkerPtr atomic.Pointer[bulk.Bulker]
+}
+
+func (f *Fleet) setBulker(b *bulk.Bulker) {
+	f.bulkerPtr.Store(b)
+}
+
+func (f *Fleet) currentBulker() *bulk.Bulker {
+	return f.bulkerPtr.Load()
 }
 
 // NewFleet creates the actual fleet server service.
@@ -101,6 +117,15 @@ func (f *Fleet) Run(ctx context.Context, initCfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("encountered error while loading server limits: %w", err)
 	}
+
+	// Class-aware admission gates live for the whole Run so traffic-only
+	// reloads swap snapshots without restarting listeners or the bulker.
+	gates := newTrafficGates()
+	if _, err := gates.Apply(initCfg); err != nil {
+		return fmt.Errorf("encountered error while applying traffic priority config: %w", err)
+	}
+	f.traffic = gates
+
 	cacheCfg := config.CopyCache(initCfg)
 	log.Info().Interface("cfg", cacheCfg).Msg("Setting cache config options")
 	cache, err := cache.New(cacheCfg, cache.WithLog(log))
@@ -160,6 +185,19 @@ LOOP:
 			return fmt.Errorf("encountered error while loading server limits: %w", err)
 		}
 
+		// Apply class-aware capacity rules atomically. On failure keep the
+		// previous good snapshot and normalize the incoming section so a
+		// bad traffic_priority neither restarts nor tears down the server.
+		_, trafficApplyErr := f.traffic.Apply(newCfg)
+		if trafficApplyErr != nil {
+			log.Error().Err(trafficApplyErr).
+				Msg("traffic priority configuration rejected; keeping previous limits")
+			if curCfg == nil {
+				return fmt.Errorf("encountered error while applying traffic priority config: %w", trafficApplyErr)
+			}
+			newCfg.Inputs[0].Server.TrafficPriority = curCfg.Inputs[0].Server.TrafficPriority
+		}
+
 		// Create or recreate cache
 		if configCacheChanged(curCfg, newCfg) {
 			log.Info().Msg("reconfigure cache on configuration change")
@@ -186,8 +224,11 @@ LOOP:
 			}
 		}
 
-		// Start or restart server
-		if configChangedServer(*log, curCfg, newCfg) {
+		// Start or restart server, unless only traffic_priority changed:
+		// valid traffic-only changes apply to the live gates/bulker
+		// without restarting listeners or subsystems.
+		restart, reason, reconfigureTraffic := reloadAction(curCfg, newCfg, trafficApplyErr)
+		if restart {
 			if srvCancel != nil {
 				log.Info().Msg("stopping server on configuration change")
 				stop(srvCancel, srvEg)
@@ -198,10 +239,13 @@ LOOP:
 					log.Warn().Msg("Server stopped expected context cancel error missing.")
 				}
 			}
-			log.Info().Msg("starting server on configuration change")
+			log.Info().Str("reason", reason).Msg("starting server on configuration change")
 			srvEg, srvCancel = start(ctx, func(ctx context.Context, cfg *config.Config) error {
 				return f.runServer(ctx, cfg)
 			}, newCfg, ech)
+		} else if reconfigureTraffic {
+			f.traffic.configureBulker(f.currentBulker())
+			log.Info().Msg("traffic priority configuration applied without server restart")
 		}
 
 		curCfg = newCfg
@@ -254,24 +298,6 @@ func configCacheChanged(curCfg, newCfg *config.Config) bool {
 		return false
 	}
 	return curCfg.Inputs[0].Cache != newCfg.Inputs[0].Cache
-}
-
-func configChangedServer(zlog zerolog.Logger, curCfg, newCfg *config.Config) bool {
-	changed := true
-	switch {
-	case curCfg == nil:
-		zlog.Info().Msg("initial server configuration")
-	case !reflect.DeepEqual(curCfg.Fleet.CopyNoLogging(), newCfg.Fleet.CopyNoLogging()):
-		zlog.Info().Msg("fleet configuration has changed")
-	case !reflect.DeepEqual(curCfg.Output, newCfg.Output):
-		zlog.Info().Msg("output configuration has changed")
-	case !reflect.DeepEqual(curCfg.Inputs[0].Server, newCfg.Inputs[0].Server):
-		zlog.Info().Msg("server configuration has changed")
-	default:
-		changed = false
-	}
-
-	return changed
 }
 
 func safeWait(log *zerolog.Logger, g *errgroup.Group, to time.Duration) error {
@@ -334,15 +360,19 @@ func initRuntime(log *zerolog.Logger, cfg *config.Config) {
 }
 
 func (f *Fleet) initBulker(ctx context.Context, tracer *apm.Tracer, cfg *config.Config) (*bulk.Bulker, error) {
-	es, err := es.NewClient(ctx, cfg, false, elasticsearchOptions(
+	es, err := es.NewClient(ctx, cfg, false, append(elasticsearchOptions(
 		cfg.Inputs[0].Server.Instrumentation.Enabled, f.bi,
-	)...)
+	), es.WithTrafficGate(f.traffic.es))...)
 	if err != nil {
 		return nil, err
 	}
 
 	bulkOpts := bulk.BulkOptsFromCfg(cfg)
 	bulkOpts = append(bulkOpts, bulk.WithBi(f.bi))
+	if snaps := f.traffic.lastSnaps(); snaps != nil {
+		bulkOpts = append(bulkOpts, bulk.WithTrafficScheduling(
+			f.traffic.bulk, snaps.MaxPendingBackgroundDispatches, snaps.BulkBackgroundFlushDelay))
+	}
 	blk := bulk.NewBulker(es, tracer, bulkOpts...)
 	return blk, nil
 }
@@ -356,8 +386,12 @@ func (f *Fleet) runServer(ctx context.Context, cfg *config.Config) (err error) {
 		return err
 	}
 
+	// Bind gate lifecycle events to Prometheus/libbeat metrics and expose
+	// the internal traffic priority debug snapshot on the metrics listener.
+	api.BindTrafficMetrics(f.traffic.stages())
+
 	// The metricsServer is only enabled if http.enabled is set in the config
-	metricsServer, err := api.InitMetrics(ctx, cfg, f.bi, tracer)
+	metricsServer, err := api.InitMetrics(ctx, cfg, f.bi, tracer, f)
 	switch {
 	case err != nil:
 		return err
@@ -378,6 +412,9 @@ func (f *Fleet) runServer(ctx context.Context, cfg *config.Config) (err error) {
 	if err != nil {
 		return err
 	}
+	f.traffic.configureBulker(bulker)
+	bulker.SetBackgroundDispatchRejectedCallback(api.IncBackgroundDispatchRejections)
+	f.setBulker(bulker)
 
 	// Execute the bulker engine in a goroutine with its orphaned context.
 	// Create an error channel for the case where the bulker exits
@@ -476,9 +513,9 @@ func (f *Fleet) runSubsystems(ctx context.Context, cfg *config.Config, g *errgro
 	g.Go(loggedRunFunc(ctx, "Elasticsearch GC", sched.Run))
 
 	// Monitoring es client, longer timeout, no retries
-	monCli, err := es.NewClient(ctx, cfg, true, elasticsearchOptions(
+	monCli, err := es.NewClient(ctx, cfg, true, append(elasticsearchOptions(
 		cfg.Inputs[0].Server.Instrumentation.Enabled, f.bi,
-	)...)
+	), es.WithTrafficGate(f.traffic.es))...)
 	if err != nil {
 		return err
 	}
@@ -539,6 +576,11 @@ func (f *Fleet) runSubsystems(ctx context.Context, cfg *config.Config, g *errgro
 	g.Go(loggedRunFunc(ctx, "Connection rejection rate sampler", func(ctx context.Context) error {
 		return api.RunConnRejectionRateSampler(ctx, api.RejectionRateSampleInterval)
 	}))
+	// Publishes bulk queue depths and the traffic_priority reload outcome.
+	g.Go(loggedRunFunc(ctx, "Traffic priority metrics sampler", func(ctx context.Context) error {
+		api.RunTrafficMetricsSampler(ctx, api.RejectionRateSampleInterval, f)
+		return nil
+	}))
 
 	ct, err := api.NewCheckinT(f.verCon, &cfg.Inputs[0].Server, f.cache, bc, pm, am, ad, bulker,
 		api.WithOutputSecretCandidateCollector(outputSecretReconciler))
@@ -578,6 +620,7 @@ func (f *Fleet) runSubsystems(ctx context.Context, cfg *config.Config, g *errgro
 			api.WithPGP(pt),
 			api.WithAudit(auditT),
 			api.WithTracer(tracer),
+			api.WithTrafficGate(f.traffic.entry),
 		)
 		g.Go(loggedRunFunc(ctx, "Http server", func(ctx context.Context) error {
 			return apiServer.Run(ctx)

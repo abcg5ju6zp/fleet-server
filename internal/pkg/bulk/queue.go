@@ -4,11 +4,19 @@
 
 package bulk
 
+import "time"
+
 type queueT struct {
 	ty      queueType
 	cnt     int
 	head    *bulkT
 	pending int
+	// controlCnt counts queued control blocks; when zero and pending>0
+	// the queue is background-only and may be deferred under overload.
+	controlCnt int
+	// bgDeferredAt is set when a background-only queue is first deferred
+	// for lack of a flush permit; it bounds starvation.
+	bgDeferredAt time.Time
 }
 
 type queueType int

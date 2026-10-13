@@ -10,27 +10,29 @@ import (
 	"math"
 
 	"go.elastic.co/apm/v2"
+
+	"github.com/elastic/fleet-server/v7/internal/pkg/traffic"
 )
 
 // TODO: Are multi requests used by anything? a quick grep shows no hits outside the bulk package.
 
 func (b *Bulker) MCreate(ctx context.Context, ops []MultiOp, opts ...Opt) ([]BulkIndexerResponseItem, error) {
-	return b.multiWaitBulkOp(ctx, ActionCreate, ops)
+	return b.multiWaitBulkOp(ctx, ActionCreate, ops, opts...)
 }
 
 func (b *Bulker) MIndex(ctx context.Context, ops []MultiOp, opts ...Opt) ([]BulkIndexerResponseItem, error) {
-	return b.multiWaitBulkOp(ctx, ActionIndex, ops)
+	return b.multiWaitBulkOp(ctx, ActionIndex, ops, opts...)
 }
 
 func (b *Bulker) MUpdate(ctx context.Context, ops []MultiOp, opts ...Opt) ([]BulkIndexerResponseItem, error) {
-	return b.multiWaitBulkOp(ctx, ActionUpdate, ops)
+	return b.multiWaitBulkOp(ctx, ActionUpdate, ops, opts...)
 }
 
 func (b *Bulker) MDelete(ctx context.Context, ops []MultiOp, opts ...Opt) ([]BulkIndexerResponseItem, error) {
-	return b.multiWaitBulkOp(ctx, ActionDelete, ops)
+	return b.multiWaitBulkOp(ctx, ActionDelete, ops, opts...)
 }
 
-func (b *Bulker) multiWaitBulkOp(ctx context.Context, action actionT, ops []MultiOp, opts ...Opt) ([]BulkIndexerResponseItem, error) { //nolint:unparam // better to keep consistency with other methods
+func (b *Bulker) multiWaitBulkOp(ctx context.Context, action actionT, ops []MultiOp, opts ...Opt) ([]BulkIndexerResponseItem, error) {
 	if len(ops) == 0 {
 		return nil, nil
 	}
@@ -42,6 +44,7 @@ func (b *Bulker) multiWaitBulkOp(ctx context.Context, action actionT, ops []Mult
 	span, ctx := apm.StartSpan(ctx, bulkSpanNames[action], "bulker")
 	defer span.End()
 	opt := b.parseOpts(opts...)
+	class := resolveClass(ctx, opt)
 
 	var spanLink apm.SpanLink
 	hasSpanLink := false
@@ -96,6 +99,7 @@ func (b *Bulker) multiWaitBulkOp(ctx context.Context, action actionT, ops []Mult
 		bulk.buf.Set(bodySlice)
 		bulk.spanLink = spanLink
 		bulk.hasSpanLink = hasSpanLink
+		bulk.class = class
 		if opt.Refresh {
 			bulk.flags.Set(flagRefresh)
 		}
@@ -131,8 +135,15 @@ func (b *Bulker) multiDispatch(ctx context.Context, blks []bulkT) error {
 
 	// Dispatch to bulk Run loop; Iterate by reference.
 	for i := range blks {
+		dst := b.ch
+		if b.trafficEnabled() {
+			dst = b.chControl
+			if blks[i].class == traffic.Background {
+				dst = b.chBackground
+			}
+		}
 		select {
-		case b.ch <- &blks[i]:
+		case dst <- &blks[i]:
 		case <-ctx.Done():
 			return ctx.Err()
 		}

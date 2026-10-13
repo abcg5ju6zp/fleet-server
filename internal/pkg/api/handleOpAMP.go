@@ -35,6 +35,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/es"
 	"github.com/elastic/fleet-server/v7/internal/pkg/limit"
 	"github.com/elastic/fleet-server/v7/internal/pkg/model"
+	"github.com/elastic/fleet-server/v7/internal/pkg/traffic"
 )
 
 const (
@@ -156,6 +157,9 @@ func (oa *OpAMPT) Enabled() bool {
 
 func (oa *OpAMPT) handleMessage(zlog zerolog.Logger, apiKey *apikey.APIKey) func(ctx context.Context, conn types.Connection, message *protobufs.AgentToServer) *protobufs.ServerToAgent {
 	return func(ctx context.Context, conn types.Connection, message *protobufs.AgentToServer) *protobufs.ServerToAgent {
+		// OpAMP message processing (heartbeats, status, enroll) is control
+		// traffic and must keep priority through batching and ES retries.
+		ctx = traffic.WithClass(ctx, traffic.Control)
 		response := &protobufs.ServerToAgent{
 			InstanceUid: message.InstanceUid,
 		}

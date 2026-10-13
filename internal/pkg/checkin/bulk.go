@@ -18,6 +18,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/dl"
 	"github.com/elastic/fleet-server/v7/internal/pkg/sqn"
+	"github.com/elastic/fleet-server/v7/internal/pkg/traffic"
 
 	"github.com/rs/zerolog"
 
@@ -385,6 +386,9 @@ func (bc *Bulk) flush(ctx context.Context) error {
 	if needRefresh {
 		opts = append(opts, bulk.WithRefresh())
 	}
+	// Aggregated check-in/OpAMP heartbeat writes are control traffic:
+	// they must keep priority under overload.
+	opts = append(opts, bulk.WithTrafficClass(traffic.Control))
 
 	items, err := bc.bulker.MUpdate(ctx, updates, opts...)
 

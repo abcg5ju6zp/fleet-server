@@ -10,6 +10,7 @@ import (
 	"go.elastic.co/apm/v2"
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/rollback"
+	"github.com/elastic/fleet-server/v7/internal/pkg/traffic"
 
 	"github.com/rs/zerolog/hlog"
 )
@@ -82,6 +83,14 @@ func WithTracer(tracer *apm.Tracer) APIOpt {
 	}
 }
 
+// WithTrafficGate injects the singleton class-aware admission gate. Both
+// HTTP listeners and the OpAMP router must share the same instance.
+func WithTrafficGate(gate *traffic.Gate) APIOpt {
+	return func(a *apiServer) {
+		a.trafficGate = gate
+	}
+}
+
 // FIXME: Cleanup needed for: metrics endpoint (actually a separate listener?), endpoint auth
 // FIXME: Should we use strict handler
 type apiServer struct {
@@ -98,6 +107,10 @@ type apiServer struct {
 
 	// tracer is used by the wrapping server to instrument the API server
 	tracer *apm.Tracer
+
+	// trafficGate is the singleton class-aware admission gate shared by
+	// every HTTP server built for this apiServer.
+	trafficGate *traffic.Gate
 }
 
 // ensure api implements the ServerInterface

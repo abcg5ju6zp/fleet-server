@@ -110,9 +110,8 @@ func Test_configChangedServer(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			log := testlog.SetLogger(t)
-			changed := configChangedServer(log, cfg, tc.cfg)
-			assert.Equal(t, changed, tc.changed)
+			changed, _ := serverChangedIgnoringTraffic(cfg, tc.cfg)
+			assert.Equal(t, tc.changed, changed)
 		})
 	}
 }

@@ -6,6 +6,7 @@ package bulk
 
 import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/danger"
+	"github.com/elastic/fleet-server/v7/internal/pkg/traffic"
 
 	"go.elastic.co/apm/v2"
 )
@@ -26,6 +27,7 @@ type bulkT struct {
 	hasSpanLink  bool
 	dedupeKey    string // enrollment dedup key (enrollment_id); routes to kQueueEnrollSearch when set
 	refreshIndex string // index to refresh before msearch in kQueueEnrollSearch
+	class        traffic.Class
 }
 
 type flagsT int8
@@ -83,6 +85,7 @@ func (blk *bulkT) reset() {
 	blk.hasSpanLink = false
 	blk.dedupeKey = ""
 	blk.refreshIndex = ""
+	blk.class = traffic.Control
 }
 
 type respT struct {

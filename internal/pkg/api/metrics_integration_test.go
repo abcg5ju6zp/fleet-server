@@ -32,11 +32,14 @@ func TestMetricsEndpoints(t *testing.T) {
 	ctx := t.Context()
 	ctx = testlog.SetLogger(t).WithContext(ctx)
 
-	srv, err := InitMetrics(ctx, cfg, bi, nil)
+	srv, err := InitMetrics(ctx, cfg, bi, nil, &fakeTrafficProvider{status: TrafficStatus{
+		Enabled: true,
+		Stages:  []TrafficStageStatus{{Stage: "entry", Enabled: false}},
+	}})
 	require.NoError(t, err, "unable to start metrics server")
 	defer srv.Stop() //nolint:errcheck // test server
 
-	paths := []string{"/stats", "/metrics"}
+	paths := []string{"/stats", "/metrics", "/debug/traffic-priority"}
 	for _, path := range paths {
 		t.Run(path, func(t *testing.T) {
 			req, err := http.NewRequestWithContext(ctx, "GET", "http://localhost:8080"+path, nil)
@@ -64,6 +67,13 @@ func TestMetricsEndpoints(t *testing.T) {
 				// fleet-controller's EPA config can rely on it being scraped.
 				require.Contains(t, checkin, "limit_max_rate")
 				require.InDelta(t, 0, checkin["limit_max_rate"], 0, "expected limit_max_rate to be 0 with no rejected checkins")
+			}
+			if path == "/debug/traffic-priority" {
+				var status TrafficStatus
+				require.NoError(t, json.NewDecoder(resp.Body).Decode(&status))
+				require.True(t, status.Enabled)
+				require.Len(t, status.Stages, 1)
+				require.Equal(t, "entry", status.Stages[0].Stage)
 			}
 		})
 	}

@@ -62,7 +62,10 @@ func NewServer(addr string, cfg *config.Server, opts ...APIOpt) *server {
 		s.connContext = a.oa.connCtx
 	}
 
-	s.handler = handler
+	// Outermost wrapper: class-aware admission runs before the connection
+	// throttle and per-route limiters (inside the router/OpAMP handler),
+	// covering both /api/fleet/* and the /v1/opamp long connection.
+	s.handler = trafficAdmission(a.trafficGate, handler)
 	return &s
 
 }

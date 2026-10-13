@@ -104,6 +104,7 @@ type (
 		PGP                PGP                     `config:"pgp"`
 		PDKDF2             PBKDF2                  `config:"pdkdf2"`
 		Features           FeatureFlags            `config:"feature_flags"`
+		TrafficPriority    TrafficPriorityConfig   `config:"traffic_priority"`
 	}
 
 	StaticPolicyTokens struct {

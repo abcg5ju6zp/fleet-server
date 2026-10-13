@@ -301,6 +301,54 @@ fleet:
 #          // A value of 0 uses the default.
 #          max_bytes: 50000000 # 50 MB, ~200,000 entries
 #
+#     # Traffic priority / overload protection.
+#     # When disabled (default) Fleet Server behaves exactly as without the feature:
+#     # no extra admission control, unchanged ordering and responses.
+#     # When enabled, requests are split into control traffic (agent check-in,
+#     # action acks, OpAMP heartbeats, enroll, status, PGP retrieval, audit-unenroll)
+#     # and background traffic (diagnostic file upload chunks/start/complete, file
+#     # download, artifact fetch). A reserved share of capacity is kept for control
+#     # traffic; background requests may borrow idle reserve capacity but stop
+#     # borrowing the moment a control request is waiting. Rejected/over-timed-out
+#     # background requests receive HTTP 429. The same priority applies to bulk
+#     # flush scheduling and to each Elasticsearch HTTP attempt (retries keep the
+#     # request class). Check-in long polls and OpAMP connections hold an entry
+#     # permit for their whole lifetime, so entry_max_in_flight must be sized for
+#     # the number of concurrently connected agents.
+#     traffic_priority:
+#       enabled: false
+#       # Fraction of every capacity reserved for control traffic, used when an
+#       # absolute reserved value is left zero. Must be within (0,1]; default 0.5.
+#       control_reserved_ratio: 0.5
+#
+#       # Entry gate: concurrent in-flight HTTP requests. 0 derives the capacity
+#       # from limits.max_connections; when enabling the feature make sure that
+#       # value (or this one) is positive, otherwise Resolve rejects the config.
+#       entry_max_in_flight: 0
+#       # Absolute control reservation at the entry gate; 0 uses the ratio.
+#       entry_control_reserved: 0
+#       # How long a background request waits for entry capacity before HTTP 429.
+#       background_wait_timeout: 2s
+#       # Reject new background requests immediately once this many are queued
+#       # at the entry gate. 0 means unbounded.
+#       max_background_waiters: 0
+#
+#       # Bulk engine gate: total concurrent flushes is bulk.flush_max_pending.
+#       bulk_control_reserved: 0
+#       bulk_background_wait_timeout: 1s
+#       # A background-only bulk queue is never deferred longer than this.
+#       bulk_background_flush_delay: 0 # 0 => 2 x bulk.flush_interval
+#       # Reject background bulk dispatches above this pending count (0 falls
+#       # back to the legacy bulk.max_pending_bulk_dispatches behaviour).
+#       max_pending_background_dispatches: 0
+#
+#       # Elasticsearch transport gate: one permit per HTTP attempt (retries
+#       # re-acquire with the same class). 0 derives capacity from
+#       # output.elasticsearch.max_conn_per_host.
+#       es_max_in_flight: 0
+#       es_control_reserved: 0
+#       es_background_wait_timeout: 2s
+#
 #    # monitor options are advanced configuration and should not be adjusted is most cases
 #    monitor:
 #      fetch_size: 1000 # The number of documents that each monitor may fetch at once

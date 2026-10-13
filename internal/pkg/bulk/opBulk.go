@@ -50,6 +50,7 @@ func (b *Bulker) waitBulkAction(ctx context.Context, action actionT, index, id s
 	span, ctx := apm.StartSpan(ctx, bulkSpanNames[action], "bulker")
 	defer span.End()
 	opt := b.parseOpts(opts...)
+	opt.trafficClass = resolveClass(ctx, opt)
 	if tx := apm.TransactionFromContext(ctx); tx != nil {
 		tCtx := tx.TraceContext()
 		opt.spanLink = apm.SpanLink{Trace: tCtx.Trace, Span: tCtx.Span}

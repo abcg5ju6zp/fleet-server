@@ -274,7 +274,7 @@ func (rt *artifactStats) IncError(err error) {
 // InitMetrics initializes metrics exposure mechanisms.
 // If tracer is not nil, prometheus metrics are shipped through the tracer.
 // If cfg.http.enabled is true a /stats endpoint is created to expose libbeat metrics and a /metrics endpoint is created to expose prometheus metrics on the specified interface.
-func InitMetrics(ctx context.Context, cfg *config.Config, bi build.Info, tracer *apm.Tracer) (*api.Server, error) {
+func InitMetrics(ctx context.Context, cfg *config.Config, bi build.Info, tracer *apm.Tracer, trafficProvider TrafficStatusProvider) (*api.Server, error) {
 	if tracer != nil {
 		tracer.RegisterMetricsGatherer(apmprometheus.Wrap(registry.promReg))
 	}
@@ -303,6 +303,9 @@ func InitMetrics(ctx context.Context, cfg *config.Config, bi build.Info, tracer 
 	}
 
 	attachPrometheusEndpoint(s, registry.promReg, bi)
+	if trafficProvider != nil {
+		s.AddRoute("/debug/traffic-priority", trafficPriorityHandler(trafficProvider).ServeHTTP)
+	}
 
 	s.Start()
 	return s, err

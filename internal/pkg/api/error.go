@@ -26,6 +26,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/limit"
 	"github.com/elastic/fleet-server/v7/internal/pkg/logger"
 	"github.com/elastic/fleet-server/v7/internal/pkg/logger/ecs"
+	"github.com/elastic/fleet-server/v7/internal/pkg/traffic"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 )
@@ -212,6 +213,24 @@ func NewHTTPErrResp(err error) HTTPErrResp {
 				"EnrollDuplicate",
 				"concurrent enrollment for same id: retry",
 				zerolog.DebugLevel,
+			},
+		},
+		{
+			traffic.ErrCapacityTimeout,
+			HTTPErrResp{
+				http.StatusTooManyRequests,
+				"TrafficLimit",
+				"timed out waiting for control-plane capacity",
+				zerolog.WarnLevel,
+			},
+		},
+		{
+			traffic.ErrCapacityRejected,
+			HTTPErrResp{
+				http.StatusTooManyRequests,
+				"TrafficLimit",
+				"rejected by traffic capacity gate",
+				zerolog.WarnLevel,
 			},
 		},
 		{

@@ -20,6 +20,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/gcheckpt"
 	"github.com/elastic/fleet-server/v7/internal/pkg/sleep"
 	"github.com/elastic/fleet-server/v7/internal/pkg/sqn"
+	"github.com/elastic/fleet-server/v7/internal/pkg/traffic"
 
 	"github.com/rs/zerolog"
 	"go.elastic.co/apm/v2"
@@ -429,6 +430,8 @@ func (m *simpleMonitorT) fetch(ctx context.Context, checkpoint, maxCheckpoint sq
 func (m *simpleMonitorT) search(ctx context.Context, tmpl *dsl.Tmpl, params map[string]any, seqNos sqn.SeqNo) ([]es.HitT, error) {
 	span, ctx := apm.StartSpan(ctx, "action", "fleet_search")
 	defer span.End()
+	// Index change detection drives check-in/action delivery: control traffic.
+	ctx = traffic.WithClass(ctx, traffic.Control)
 	query, err := tmpl.Render(params)
 	if err != nil {
 		return nil, err

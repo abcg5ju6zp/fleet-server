@@ -1,0 +1,5 @@
+kind: enhancement
+
+summary: Add class-aware overload protection reserving capacity for control-plane traffic (check-in, acks, OpAMP) over background uploads, downloads and artifact fetches, with traffic_priority config, hot reload, /debug/traffic-priority state endpoint and traffic_priority_* metrics
+
+component: fleet-server
