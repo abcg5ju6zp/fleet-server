@@ -1,0 +1,21 @@
+kind: feature
+
+summary: Add per-namespace fair-share budgets for check-in, acks, bulk queue, policy/action dispatch and cache cost
+
+description: |
+  Adds namespace-scoped fair-share accounting on top of the existing global
+  limits (enabled by default; configurable via server.namespace_budgets).
+  Each resource keeps the legacy global ceiling plus per-namespace guaranteed
+  shares with work-conserving borrow: capacity lent while other namespaces are
+  idle is reclaimed when a contending namespace needs its guarantee, without
+  preempting in-flight requests or long polls. Persistent Elasticsearch
+  failures arm an exponential per-namespace backoff so 429/5xx storms isolate
+  the responsible namespace. The shared cache enforces guaranteed per-namespace
+  byte-cost shares, evicting borrowed entries before guaranteed ones. Rejections
+  reuse the existing 429 response and add Retry-After during backoff;
+  per-namespace occupancy, guarantee, borrow, rejection, failure, backoff and
+  cache eviction metrics are exposed on /metrics, with an explainable budget
+  section on authenticated /api/status. Single-namespace, disabled-switch and
+  unauthenticated deployments keep their previous behavior.
+
+component: fleet-server

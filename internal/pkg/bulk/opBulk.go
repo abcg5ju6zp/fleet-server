@@ -281,6 +281,8 @@ func (b *Bulker) flushBulk(ctx context.Context, queue queueT) error {
 		next := n.next // 'n' is invalid immediately on channel send
 
 		item := blk.Items[i].Choose()
+		n.releaseOwnerLeases()
+		b.reportOwnerItem(n, item.Status)
 		select {
 		case n.ch <- respT{
 			err:  item.deriveError(),

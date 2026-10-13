@@ -21,6 +21,8 @@ import (
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/apikey"
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
 	"github.com/elastic/fleet-server/v7/internal/pkg/file"
@@ -50,10 +52,11 @@ type UploadT struct {
 	uploader    *uploader.Uploader
 	authAgent   func(*http.Request, *string, bulk.Bulk, cache.Cache) (*model.Agent, error) // injectable for testing purposes
 	authAPIKey  func(*http.Request, bulk.Bulk, cache.Cache) (*apikey.APIKey, error)        // as above
+	budgets     *budget.Registry
 }
 
-func NewUploadT(cfg *config.Server, bulker bulk.Bulk, chunkClient *elasticsearch.Client, cache cache.Cache) *UploadT {
-	return &UploadT{
+func NewUploadT(cfg *config.Server, bulker bulk.Bulk, chunkClient *elasticsearch.Client, cache cache.Cache, opts ...func(*UploadT)) *UploadT {
+	ut := &UploadT{
 		cfg:         cfg,
 		chunkClient: chunkClient,
 		bulker:      bulker,
@@ -62,6 +65,10 @@ func NewUploadT(cfg *config.Server, bulker bulk.Bulk, chunkClient *elasticsearch
 		authAgent:   authAgent,
 		authAPIKey:  authAPIKey,
 	}
+	for _, opt := range opts {
+		opt(ut)
+	}
+	return ut
 }
 
 func (ut *UploadT) validateUploadBeginRequest(ctx context.Context, reader io.Reader) (uploader.JSDict, string, error) {
@@ -106,6 +113,13 @@ func (ut *UploadT) handleUploadBegin(_ zerolog.Logger, w http.ResponseWriter, r 
 		return err
 	}
 
+	ctx, lease, admitted := acquireTenantBudget(r, w, ut.budgets, budget.ResourceUploadBegin, tenant.Canonical(agent.Namespaces))
+	if !admitted {
+		return nil
+	}
+	defer lease.Release()
+	r = r.WithContext(ctx)
+
 	// validate payload, enrich with additional fields, and write metadata doc to ES
 	info, err := ut.uploader.Begin(r.Context(), agent.Namespaces, payload)
 	if err != nil {
@@ -140,9 +154,17 @@ func (ut *UploadT) handleUploadChunk(zlog zerolog.Logger, w http.ResponseWriter,
 	}
 
 	// Validate that the requesting agent owns this upload session
-	if _, err := ut.authAgent(r, &upinfo.AgentID, ut.bulker, ut.cache); err != nil {
+	chunkAgent, err := ut.authAgent(r, &upinfo.AgentID, ut.bulker, ut.cache)
+	if err != nil {
 		return fmt.Errorf("error authenticating for chunk upload: %w", err)
 	}
+
+	ctx, lease, admitted := acquireTenantBudget(r, w, ut.budgets, budget.ResourceUploadChunk, tenant.Canonical(chunkAgent.Namespaces))
+	if !admitted {
+		return nil
+	}
+	defer lease.Release()
+	r = r.WithContext(ctx)
 
 	// prevent over-sized chunks
 	data := http.MaxBytesReader(w, r.Body, file.MaxChunkSize)
@@ -180,35 +202,35 @@ func (ut *UploadT) handleUploadChunk(zlog zerolog.Logger, w http.ResponseWriter,
 	return nil
 }
 
-func (ut *UploadT) validateUploadCompleteRequest(r *http.Request, id string) (string, error) {
+func (ut *UploadT) validateUploadCompleteRequest(r *http.Request, id string) (*model.Agent, string, error) {
 	span, ctx := apm.StartSpan(r.Context(), "validateRequest", "validate")
 	defer span.End()
 
 	info, err := ut.uploader.GetUploadInfo(ctx, id)
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
 	// need to auth that it matches the ID in the initial
 	// doc, but that means we had to doc-lookup early
-	if _, err := ut.authAgent(r, &info.AgentID, ut.bulker, ut.cache); err != nil {
-		return "", fmt.Errorf("error authenticating for upload finalization: %w", err)
+	completeAgent, err := ut.authAgent(r, &info.AgentID, ut.bulker, ut.cache)
+	if err != nil {
+		return nil, "", fmt.Errorf("error authenticating for upload finalization: %w", err)
 	}
-
 	var req UploadCompleteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			return "", uploader.ErrPayloadSizeTooLarge
+			return nil, "", uploader.ErrPayloadSizeTooLarge
 		}
 
-		return "", &BadRequestErr{msg: "unable to decode upload complete request"}
+		return nil, "", &BadRequestErr{msg: "unable to decode upload complete request"}
 	}
 
 	hash := strings.TrimSpace(req.Transithash.Sha256)
 	if hash == "" {
-		return "", ErrTransitHashRequired
+		return nil, "", ErrTransitHashRequired
 	}
-	return hash, nil
+	return completeAgent, hash, nil
 }
 
 func (ut *UploadT) handleUploadComplete(_ zerolog.Logger, w http.ResponseWriter, r *http.Request, uplID string) error {
@@ -217,10 +239,16 @@ func (ut *UploadT) handleUploadComplete(_ zerolog.Logger, w http.ResponseWriter,
 		r.Body = http.MaxBytesReader(w, r.Body, ut.cfg.Limits.UploadEndLimit.MaxBody)
 	}
 
-	hash, err := ut.validateUploadCompleteRequest(r, uplID)
+	completeAgent, hash, err := ut.validateUploadCompleteRequest(r, uplID)
 	if err != nil {
 		return err
 	}
+
+	_, lease, admitted := acquireTenantBudget(r, w, ut.budgets, budget.ResourceUploadComplete, tenant.Canonical(completeAgent.Namespaces))
+	if !admitted {
+		return nil
+	}
+	defer lease.Release()
 
 	_, err = ut.uploader.Complete(r.Context(), uplID, hash)
 	if err != nil {

@@ -15,6 +15,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/file"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/gofrs/uuid/v5"
 	"go.elastic.co/apm/v2"
@@ -224,6 +225,7 @@ func (u *Uploader) GetUploadInfo(ctx context.Context, uploadID string) (file.Inf
 	if err != nil {
 		return file.Info{}, fmt.Errorf("unable to retrieve upload info: %w", err)
 	}
-	u.cache.SetUpload(uploadID, info)
+	owner, _ := tenant.OwnerFromContext(ctx)
+	u.cache.SetUpload(uploadID, info, owner)
 	return info, nil
 }

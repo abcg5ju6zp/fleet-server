@@ -11,8 +11,10 @@ import (
 	"github.com/rs/zerolog"
 	"go.elastic.co/apm/v2"
 
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/build"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 )
 
 //-----
@@ -28,6 +30,7 @@ type optionsT struct {
 	hasSpanLink        bool
 	DedupeKey          string
 	RefreshIndex       string
+	owner              tenant.Owner
 }
 
 type Opt func(*optionsT)
@@ -92,6 +95,7 @@ type bulkOptT struct {
 	bi                       build.Info
 	enrollFlushInterval      time.Duration
 	enrollFlushThresholdCnt  int
+	budgets                  *budget.Registry
 }
 
 type BulkOpt func(*bulkOptT)
@@ -185,6 +189,18 @@ func WithEnrollFlushInterval(d time.Duration) BulkOpt {
 // of the kQueueEnrollSearch queue.
 func WithEnrollFlushThresholdCount(cnt int) BulkOpt {
 	return func(opt *bulkOptT) { opt.enrollFlushThresholdCnt = cnt }
+}
+
+// WithBudgets injects the process-wide namespace budget registry used for
+// per-owner dispatch admission, flush fairness and backoff.
+func WithBudgets(r *budget.Registry) BulkOpt {
+	return func(opt *bulkOptT) { opt.budgets = r }
+}
+
+// WithOwner pins the resource ownership snapshot of one transaction; it is
+// copied onto its block at dispatch. Prefer deriving it from context.
+func WithOwner(owner tenant.Owner) Opt {
+	return func(opt *optionsT) { opt.owner = owner }
 }
 
 func parseBulkOpts(opts ...BulkOpt) bulkOptT {

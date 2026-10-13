@@ -104,7 +104,7 @@ func TestMonitor_NewPolicy(t *testing.T) {
 
 	agentId := uuid.Must(uuid.NewV4()).String()
 	policyID := uuid.Must(uuid.NewV4()).String()
-	s, err := monitor.Subscribe(agentId, policyID, 0)
+	s, err := monitor.Subscribe(agentId, policyID, 0, "space-a")
 	defer monitor.Unsubscribe(s)
 	require.NoError(t, err)
 
@@ -181,7 +181,7 @@ func TestMonitor_SamePolicy(t *testing.T) {
 
 	agentId := uuid.Must(uuid.NewV4()).String()
 	policyId := uuid.Must(uuid.NewV4()).String()
-	s, err := monitor.Subscribe(agentId, policyId, 1)
+	s, err := monitor.Subscribe(agentId, policyId, 1, "space-a")
 	defer monitor.Unsubscribe(s)
 	require.NoError(t, err)
 
@@ -291,7 +291,7 @@ func runTestMonitor_NewPolicyExists(t *testing.T, delay time.Duration) {
 	err := monitor.(*monitorT).waitStart(ctx)
 	require.NoError(t, err)
 
-	s, err := monitor.Subscribe(agentId, policyId, 1)
+	s, err := monitor.Subscribe(agentId, policyId, 1, "space-a")
 	defer monitor.Unsubscribe(s)
 	require.NoError(t, err)
 
@@ -365,7 +365,7 @@ func Test_Monitor_Limit_Delay(t *testing.T) {
 
 		subs := make([]Subscription, 0, 3)
 		for range cap(subs) {
-			sub, err := monitor.Subscribe(uuid.Must(uuid.NewV4()).String(), policyID, 0)
+			sub, err := monitor.Subscribe(uuid.Must(uuid.NewV4()).String(), policyID, 0, "space-a")
 			require.NoError(t, err)
 			defer monitor.Unsubscribe(sub)
 			subs = append(subs, sub)
@@ -454,7 +454,7 @@ func Test_Monitor_pending_sub_gets_latest_revision(t *testing.T) {
 
 		subs := make([]Subscription, 2)
 		for i := range subs {
-			sub, err := monitor.Subscribe(uuid.Must(uuid.NewV4()).String(), policyID, 0)
+			sub, err := monitor.Subscribe(uuid.Must(uuid.NewV4()).String(), policyID, 0, "space-a")
 			require.NoError(t, err)
 			defer monitor.Unsubscribe(sub)
 			subs[i] = sub
@@ -700,7 +700,7 @@ func Test_Monitor_repeated_events_do_not_strand_subscriber_in_rate_limiter(t *te
 
 			subs := make([]Subscription, 2)
 			for i := range subs {
-				sub, err := monitor.Subscribe(uuid.Must(uuid.NewV4()).String(), policyID, 0)
+				sub, err := monitor.Subscribe(uuid.Must(uuid.NewV4()).String(), policyID, 0, "space-a")
 				require.NoError(t, err)
 				defer monitor.Unsubscribe(sub)
 				subs[i] = sub

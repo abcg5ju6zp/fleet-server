@@ -18,6 +18,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/dl"
 	"github.com/elastic/fleet-server/v7/internal/pkg/sqn"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 
 	"github.com/rs/zerolog"
 
@@ -72,6 +73,14 @@ func WithMeta(meta []byte) Option {
 			pending.extra = &extraT{}
 		}
 		pending.extra.meta = meta
+	}
+}
+
+// WithOwner attributes the timestamp write to the request's namespace
+// owner; unattributed writes stay on the default bulk bucket.
+func WithOwner(owner tenant.Owner) Option {
+	return func(pending *pendingT) {
+		pending.owner = owner
 	}
 }
 
@@ -195,6 +204,7 @@ type pendingT struct {
 	extra           *extraT
 	unhealthyReason *[]string
 	sequenceNum     uint64
+	owner           tenant.Owner
 }
 
 // Bulk will batch pending checkins and update elasticsearch at a set interval.
@@ -385,8 +395,19 @@ func (bc *Bulk) flush(ctx context.Context) error {
 	if needRefresh {
 		opts = append(opts, bulk.WithRefresh())
 	}
+	// Best-effort owner attribution: timestamp writes are best-effort, and
+	// a mixed-owner batch falls into the default bucket. Per-owner
+	// dispatch rejection must not fail check-in accounting; the agents
+	// retry on their next check-in and the rejection is logged.
+	if uniformOwner, ok := uniformCheckinOwner(pending); ok {
+		opts = append(opts, bulk.WithOwner(uniformOwner))
+	}
 
 	items, err := bc.bulker.MUpdate(ctx, updates, opts...)
+	if errors.Is(err, bulk.ErrTenantDispatchLimit) {
+		zerolog.Ctx(ctx).Warn().Err(err).Msg("checkin timestamp batch rejected by namespace dispatch budget; check-in response unaffected")
+		err = nil
+	}
 
 	zerolog.Ctx(ctx).Trace().
 		Err(err).
@@ -398,6 +419,30 @@ func (bc *Bulk) flush(ctx context.Context) error {
 	logCheckinBulkErrors(zerolog.Ctx(ctx), items)
 
 	return err
+}
+
+// uniformCheckinOwner returns the owner when every pending write in the
+// batch shares one; the boolean is false for empty or mixed batches.
+func uniformCheckinOwner(pending map[string]pendingT) (tenant.Owner, bool) {
+	if len(pending) == 0 {
+		return tenant.Default, true
+	}
+	var owner tenant.Owner
+	first := true
+	for _, p := range pending {
+		if first {
+			owner = p.owner
+			first = false
+			continue
+		}
+		if p.owner != owner {
+			return "", false
+		}
+	}
+	if owner == "" {
+		return tenant.Default, true
+	}
+	return owner, true
 }
 
 // logCheckinBulkErrors logs a summary when MUpdate returns per-item ES failures.

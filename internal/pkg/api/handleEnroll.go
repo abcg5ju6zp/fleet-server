@@ -25,6 +25,7 @@ import (
 
 	"github.com/elastic/elastic-agent-libs/str"
 	"github.com/elastic/fleet-server/v7/internal/pkg/apikey"
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
@@ -34,6 +35,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/model"
 	"github.com/elastic/fleet-server/v7/internal/pkg/rollback"
 	"github.com/elastic/fleet-server/v7/internal/pkg/sqn"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 	"github.com/elastic/go-elasticsearch/v8/esapi"
 
 	"github.com/gofrs/uuid/v5"
@@ -71,19 +73,24 @@ var (
 )
 
 type EnrollerT struct {
-	verCon version.Constraints
-	cfg    *config.Server
-	bulker bulk.Bulk
-	cache  cache.Cache
+	verCon  version.Constraints
+	cfg     *config.Server
+	bulker  bulk.Bulk
+	cache   cache.Cache
+	budgets *budget.Registry
 }
 
-func NewEnrollerT(verCon version.Constraints, cfg *config.Server, bulker bulk.Bulk, c cache.Cache) (*EnrollerT, error) {
-	return &EnrollerT{
+func NewEnrollerT(verCon version.Constraints, cfg *config.Server, bulker bulk.Bulk, c cache.Cache, opts ...func(*EnrollerT)) (*EnrollerT, error) {
+	et := &EnrollerT{
 		verCon: verCon,
 		cfg:    cfg,
 		bulker: bulker,
 		cache:  c,
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(et)
+	}
+	return et, nil
 }
 
 func (et *EnrollerT) handleEnroll(zlog zerolog.Logger, w http.ResponseWriter, r *http.Request, rb *rollback.Rollback, userAgent string) error {
@@ -126,6 +133,17 @@ func (et *EnrollerT) processRequest(zlog zerolog.Logger, w http.ResponseWriter, 
 		zlog.Debug().Msgf("Found enrollment key %s", key.APIKeyID)
 		enrollAPI = key
 	}
+
+	// Second admission stage, attributed to the namespaces of the
+	// enrollment key (static policy tokens fall into the default bucket).
+	// The claimed lease stays on r for the rest of the enrollment.
+	ctx, lease, admitted := acquireTenantBudget(r, w, et.budgets, budget.ResourceEnroll, tenant.Canonical(enrollAPI.Namespaces))
+	if !admitted {
+		return nil, "", nil
+	}
+	defer lease.Release()
+	r = r.WithContext(ctx)
+
 	body := r.Body
 
 	// Limit the size of the body to prevent malicious agent from exhausting RAM in server
@@ -752,7 +770,7 @@ func (et *EnrollerT) fetchEnrollmentKeyRecord(ctx context.Context, id string) (*
 	}
 
 	cost := int64(len(rec.APIKey))
-	et.cache.SetEnrollmentAPIKey(id, rec, cost)
+	et.cache.SetEnrollmentAPIKey(id, rec, cost, tenant.Canonical(rec.Namespaces))
 
 	return &rec, nil
 }

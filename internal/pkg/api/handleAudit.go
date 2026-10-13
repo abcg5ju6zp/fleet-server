@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
 	"github.com/elastic/fleet-server/v7/internal/pkg/dl"
@@ -25,17 +27,22 @@ import (
 var ErrAuditUnenrollReason = fmt.Errorf("agent document contains audit_unenroll_reason: orphaned")
 
 type AuditT struct {
-	cfg   *config.Server
-	bulk  bulk.Bulk
-	cache cache.Cache
+	cfg     *config.Server
+	bulk    bulk.Bulk
+	cache   cache.Cache
+	budgets *budget.Registry
 }
 
-func NewAuditT(cfg *config.Server, bulker bulk.Bulk, cache cache.Cache) *AuditT {
-	return &AuditT{
+func NewAuditT(cfg *config.Server, bulker bulk.Bulk, cache cache.Cache, opts ...func(*AuditT)) *AuditT {
+	audit := &AuditT{
 		cfg:   cfg,
 		bulk:  bulker,
 		cache: cache,
 	}
+	for _, opt := range opts {
+		opt(audit)
+	}
+	return audit
 }
 
 func (audit *AuditT) handleUnenroll(zlog zerolog.Logger, w http.ResponseWriter, r *http.Request, id string) error {
@@ -45,6 +52,13 @@ func (audit *AuditT) handleUnenroll(zlog zerolog.Logger, w http.ResponseWriter, 
 	}
 	zlog = zlog.With().Str(LogAccessAPIKeyID, agent.AccessAPIKeyID).Logger()
 	ctx := zlog.WithContext(r.Context())
+	r = r.WithContext(ctx)
+
+	ctx, lease, admitted := acquireTenantBudget(r, w, audit.budgets, budget.ResourceAudit, tenant.Canonical(agent.Namespaces))
+	if !admitted {
+		return nil
+	}
+	defer lease.Release()
 	r = r.WithContext(ctx)
 
 	return audit.unenroll(zlog, w, r, agent)

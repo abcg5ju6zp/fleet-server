@@ -17,6 +17,7 @@ import (
 	"go.elastic.co/apm/v2"
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/apikey"
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/dl"
 	"github.com/elastic/fleet-server/v7/internal/pkg/es"
@@ -202,6 +203,15 @@ func NewHTTPErrResp(err error) HTTPErrResp {
 				http.StatusTooManyRequests,
 				"TooManyBulkDispatches",
 				"too many pending bulk dispatches",
+				zerolog.WarnLevel,
+			},
+		},
+		{
+			bulk.ErrTenantDispatchLimit,
+			HTTPErrResp{
+				http.StatusTooManyRequests,
+				"TenantDispatchLimit",
+				"namespace bulk dispatch budget exhausted",
 				zerolog.WarnLevel,
 			},
 		},
@@ -606,8 +616,7 @@ func NewHTTPErrResp(err error) HTTPErrResp {
 		}
 	}
 
-	var drErr *BadRequestErr
-	if errors.As(err, &drErr) {
+	if _, ok := errors.AsType[*BadRequestErr](err); ok {
 		return HTTPErrResp{
 			http.StatusBadRequest,
 			"BadRequest",
@@ -617,8 +626,7 @@ func NewHTTPErrResp(err error) HTTPErrResp {
 	}
 
 	// If it's a JSON marshal error
-	var jErr *json.MarshalerError
-	if errors.As(err, &jErr) {
+	if _, ok := errors.AsType[*json.MarshalerError](err); ok {
 		return HTTPErrResp{
 			http.StatusInternalServerError,
 			err.Error(),
@@ -627,8 +635,7 @@ func NewHTTPErrResp(err error) HTTPErrResp {
 		}
 	}
 
-	var esErr *es.ErrElastic
-	if errors.As(err, &esErr) {
+	if esErr, ok := errors.AsType[*es.ErrElastic](err); ok {
 		level := zerolog.ErrorLevel
 		if esErr.Status == http.StatusTooManyRequests {
 			// 429 from ES is transient backpressure; the agent will retry on its next checkin.
@@ -699,6 +706,14 @@ func ErrorResp(w http.ResponseWriter, r *http.Request, err error) {
 			}
 		}
 		apm.CaptureError(r.Context(), err).Send()
+	}
+
+	// Per-namespace backoff rejections hint at the retry time; capacity
+	// rejections have no delay to hint.
+	if rej, ok := errors.AsType[*budget.RejectError](err); ok {
+		if d := rej.RetryAfter; d > 0 {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int((d+time.Second-1)/time.Second)))
+		}
 	}
 
 	if rerr := resp.Write(w); rerr != nil {

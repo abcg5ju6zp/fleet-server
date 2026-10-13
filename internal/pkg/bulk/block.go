@@ -5,7 +5,9 @@
 package bulk
 
 import (
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/danger"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 
 	"go.elastic.co/apm/v2"
 )
@@ -26,6 +28,15 @@ type bulkT struct {
 	hasSpanLink  bool
 	dedupeKey    string // enrollment dedup key (enrollment_id); routes to kQueueEnrollSearch when set
 	refreshIndex string // index to refresh before msearch in kQueueEnrollSearch
+
+	// owner is the immutable resource ownership captured at dispatch time;
+	// every accounting decision for this block uses it.
+	owner tenant.Owner
+	// dispatchLease reserves a queue position and its in-flight flush
+	// reservation for owner. They are released once the block's response
+	// has been fanned out (or immediately on pre-flush failure/drain).
+	dispatchLease budget.Lease
+	flushLease    budget.Lease
 }
 
 type flagsT int8
@@ -83,6 +94,21 @@ func (blk *bulkT) reset() {
 	blk.hasSpanLink = false
 	blk.dedupeKey = ""
 	blk.refreshIndex = ""
+	blk.owner = ""
+	blk.releaseOwnerLeases()
+}
+
+// releaseOwnerLeases returns the dispatch and flush reservations exactly
+// once, regardless of which termination path reached the block.
+func (blk *bulkT) releaseOwnerLeases() {
+	if blk.dispatchLease != nil {
+		blk.dispatchLease.Release()
+		blk.dispatchLease = nil
+	}
+	if blk.flushLease != nil {
+		blk.flushLease.Release()
+		blk.flushLease = nil
+	}
 }
 
 type respT struct {

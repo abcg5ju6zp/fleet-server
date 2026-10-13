@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
 	"github.com/elastic/fleet-server/v7/internal/pkg/file"
@@ -47,15 +48,20 @@ type FileDeliveryT struct {
 	cache     cache.Cache
 	deliverer *delivery.Deliverer
 	authAgent func(*http.Request, *string, bulk.Bulk, cache.Cache) (*model.Agent, error) // injectable for testing purposes
+	budgets   *budget.Registry
 }
 
-func NewFileDeliveryT(cfg *config.Server, bulker bulk.Bulk, chunkClient *elasticsearch.Client, cache cache.Cache) *FileDeliveryT {
-	return &FileDeliveryT{
+func NewFileDeliveryT(cfg *config.Server, bulker bulk.Bulk, chunkClient *elasticsearch.Client, cache cache.Cache, opts ...func(*FileDeliveryT)) *FileDeliveryT {
+	ft := &FileDeliveryT{
 		bulker:    bulker,
 		cache:     cache,
 		deliverer: delivery.New(chunkClient, bulker, cfg.Limits.MaxFileStorageByteSize),
 		authAgent: authAgent,
 	}
+	for _, opt := range opts {
+		opt(ft)
+	}
+	return ft
 }
 
 func (ft *FileDeliveryT) handleSendFile(zlog zerolog.Logger, w http.ResponseWriter, r *http.Request, fileID string) error {
@@ -63,6 +69,13 @@ func (ft *FileDeliveryT) handleSendFile(zlog zerolog.Logger, w http.ResponseWrit
 	if err != nil {
 		return err
 	}
+
+	ctx, lease, admitted := acquireTenantBudget(r, w, ft.budgets, budget.ResourceFileDelivery, tenant.Canonical(agent.Namespaces))
+	if !admitted {
+		return nil
+	}
+	defer lease.Release()
+	r = r.WithContext(ctx)
 
 	// determine storage place for file lookup Can be either in integration libraries ( ?source=X ) OR agent-targeted, fleet-owned stream
 	var info file.MetaDoc

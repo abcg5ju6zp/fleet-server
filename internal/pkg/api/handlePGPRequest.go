@@ -19,6 +19,8 @@ import (
 	"go.elastic.co/apm/v2"
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
 )
@@ -35,17 +37,22 @@ var (
 )
 
 type PGPRetrieverT struct {
-	bulker bulk.Bulk
-	cache  cache.Cache
-	cfg    config.PGP
+	bulker  bulk.Bulk
+	cache   cache.Cache
+	cfg     config.PGP
+	budgets *budget.Registry
 }
 
-func NewPGPRetrieverT(cfg *config.Server, bulker bulk.Bulk, c cache.Cache) *PGPRetrieverT {
-	return &PGPRetrieverT{
+func NewPGPRetrieverT(cfg *config.Server, bulker bulk.Bulk, c cache.Cache, opts ...func(*PGPRetrieverT)) *PGPRetrieverT {
+	pt := &PGPRetrieverT{
 		bulker: bulker,
 		cache:  c,
 		cfg:    cfg.PGP,
 	}
+	for _, opt := range opts {
+		opt(pt)
+	}
+	return pt
 }
 
 func (pt *PGPRetrieverT) handlePGPKey(zlog zerolog.Logger, w http.ResponseWriter, r *http.Request, _, _, _ int) error {
@@ -55,6 +62,13 @@ func (pt *PGPRetrieverT) handlePGPKey(zlog zerolog.Logger, w http.ResponseWriter
 	// auth is not required for this endpoint.
 	// we also do not check if an API key is present in order to avoid making a round trip.
 	ctx := zlog.WithContext(r.Context())
+
+	// Identity-less endpoint: every retrieval shares the default bucket.
+	_, lease, admitted := acquireTenantBudget(r, w, pt.budgets, budget.ResourcePGP, tenant.Default)
+	if !admitted {
+		return nil
+	}
+	defer lease.Release()
 
 	p, err := pt.getPGPKey(ctx, zlog)
 	if err != nil {

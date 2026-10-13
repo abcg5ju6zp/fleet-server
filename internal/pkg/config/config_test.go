@@ -567,6 +567,7 @@ func defaultServer() Server {
 	log := zerolog.Nop()
 	var d Server
 	d.InitDefaults()
+	d.NamespaceBudgets.InitDefaults()
 	d.Limits.LoadLimits(loadLimits(&log, 0))
 	return d
 }

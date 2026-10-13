@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/es"
 	"github.com/elastic/fleet-server/v7/internal/pkg/logger/ecs"
@@ -17,6 +18,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/monitor"
 	"github.com/elastic/fleet-server/v7/internal/pkg/secret"
 	"github.com/elastic/fleet-server/v7/internal/pkg/sqn"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 
 	"github.com/rs/zerolog"
 	"golang.org/x/time/rate"
@@ -26,6 +28,7 @@ import (
 type Sub struct {
 	agentID string
 	seqNo   sqn.SeqNo
+	owner   tenant.Owner
 	ch      chan []model.Action
 }
 
@@ -36,26 +39,42 @@ func (s Sub) Ch() chan []model.Action {
 
 // Dispatcher tracks agent subscriptions and emits actions to the subscriptions.
 type Dispatcher struct {
-	am     monitor.SimpleMonitor
-	limit  *rate.Limiter
-	bulker bulk.Bulk
+	am      monitor.SimpleMonitor
+	limit   *rate.Limiter
+	bulker  bulk.Bulk
+	budgets *budget.Registry
 
 	mx   sync.RWMutex
 	subs map[string]Sub
 }
 
+// DispatcherOption configures a Dispatcher at construction.
+type DispatcherOption func(*Dispatcher)
+
+// WithBudgets injects the namespace budget registry for per-owner fan-out
+// fairness.
+func WithBudgets(r *budget.Registry) DispatcherOption {
+	return func(d *Dispatcher) {
+		d.budgets = r
+	}
+}
+
 // NewDispatcher creates a Dispatcher using the provided monitor.
-func NewDispatcher(am monitor.SimpleMonitor, throttle time.Duration, i int, bulker bulk.Bulk) *Dispatcher {
+func NewDispatcher(am monitor.SimpleMonitor, throttle time.Duration, i int, bulker bulk.Bulk, opts ...DispatcherOption) *Dispatcher {
 	r := rate.Inf
 	if throttle > 0 {
 		r = rate.Every(throttle)
 	}
-	return &Dispatcher{
+	d := &Dispatcher{
 		am:     am,
 		limit:  rate.NewLimiter(r, i),
 		subs:   make(map[string]Sub),
 		bulker: bulker,
 	}
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d
 }
 
 // Run starts the Dispatcher.
@@ -74,12 +93,16 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 
 // Subscribe generates a new subscription with the Dispatcher using the provided agentID and seqNo.
 // There is no check to ensure that the agentID has not been used; using the same one twice results in undefined behaviour.
-func (d *Dispatcher) Subscribe(log zerolog.Logger, agentID string, seqNo sqn.SeqNo) *Sub {
+func (d *Dispatcher) Subscribe(log zerolog.Logger, agentID string, seqNo sqn.SeqNo, owner tenant.Owner) *Sub {
+	if owner == "" {
+		owner = tenant.Default
+	}
 	cbCh := make(chan []model.Action, 1)
 
 	sub := Sub{
 		agentID: agentID,
 		seqNo:   seqNo,
+		owner:   owner,
 		ch:      cbCh,
 	}
 
@@ -151,6 +174,24 @@ func (d *Dispatcher) process(ctx context.Context, hits []es.HitT) {
 	}
 }
 
+// ownerGate claims the per-owner action_dispatch budget for one fan-out
+// round; on rejection the owner's actions are dropped for this monitor
+// tick (they are re-delivered on later ticks) and other owners remain
+// unaffected.
+func (d *Dispatcher) ownerGate(ctx context.Context, owner tenant.Owner) (budget.Lease, bool) {
+	if d.budgets == nil {
+		return budget.NopLease(owner, budget.ResourceActionDispatch), true
+	}
+	lease, err := d.budgets.TryAcquire(budget.ResourceActionDispatch, owner)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).
+			Str("owner", string(owner)).
+			Msg("action dispatch skipped for namespace owner")
+		return nil, false
+	}
+	return lease, true
+}
+
 // offsetStartTime will return a new start time between start:start+dur based on index i and the total number of agents
 // As we expect i < total  the latest return time will always be < start+dur
 func offsetStartTime(ctx context.Context, start string, dur int64, i, total int) string {
@@ -184,6 +225,29 @@ func (d *Dispatcher) dispatch(ctx context.Context, agentID string, acdocs []mode
 		zerolog.Ctx(ctx).Debug().Str(ecs.AgentID, agentID).Msg("Agent is not currently connected. Not dispatching actions.")
 		return
 	}
+
+	lease, admitted := d.ownerGate(ctx, sub.owner)
+	if !admitted {
+		return
+	}
+	defer lease.Release()
+
+	// Per-owner in-flight fan-out reservation: a backed-off or
+	// saturated owner drops this tick instead of queuing behind a slow
+	// consumer; the slow agent picks actions up on its next check-in.
+	fanout := budget.NopLease(sub.owner, budget.ResourceActionFanout)
+	if d.budgets != nil {
+		l, err := d.budgets.TryAcquire(budget.ResourceActionFanout, sub.owner)
+		if err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).
+				Str("owner", string(sub.owner)).Str(ecs.AgentID, agentID).
+				Msg("action fanout dropped for namespace owner")
+			return
+		}
+		fanout = l
+	}
+	defer fanout.Release()
+
 	select {
 	case sub.Ch() <- acdocs:
 	default:

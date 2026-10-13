@@ -243,6 +243,7 @@ func (b *Bulker) flushUpdateAPIKey(ctx context.Context, queue queueT) error {
 		next := n.next // 'n' is invalid immediately on channel send
 		responseIdx := IDToResponse[idxToID[n.idx]]
 		res := responses[responseIdx]
+		n.releaseOwnerLeases()
 		select {
 		case n.ch <- respT{
 			err: nil,

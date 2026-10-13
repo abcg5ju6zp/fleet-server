@@ -6,12 +6,14 @@ package policy
 
 import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/model"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 )
 
 type subT struct {
 	policyID string
 	agentID  string // not logically necessary; cached for logging
 	revIdx   int64
+	owner    tenant.Owner
 
 	next *subT
 	prev *subT
@@ -19,11 +21,12 @@ type subT struct {
 	ch chan *ParsedPolicy
 }
 
-func NewSub(policyID, agentID string, revIdx int64) *subT {
+func NewSub(policyID, agentID string, revIdx int64, owner tenant.Owner) *subT {
 	return &subT{
 		policyID: policyID,
 		agentID:  agentID,
 		revIdx:   revIdx,
+		owner:    owner,
 		ch:       make(chan *ParsedPolicy, 1),
 	}
 }
@@ -72,6 +75,38 @@ func (n *subT) unlink() bool { //nolint:unparam // useful to return this if we e
 
 func (n *subT) isEmpty() bool {
 	return n.next == n
+}
+
+// popFair removes and returns the subscription with the oldest dispatch
+// credit among the candidate class (cloud policies are served before
+// ordinary ones, preserving historical priority). Owners never served
+// have credit 0 and go first; ties keep FIFO. skip lists owners that
+// must not be dispatched this round (e.g. namespace budget rejected).
+func (n *subT) popFair(cloudPolicy map[string]bool, lastServed map[tenant.Owner]int64, skip map[tenant.Owner]struct{}) *subT {
+	// One pass per priority class: cloud policies first when any are
+	// waiting, then ordinary policies. Within a class the subscription
+	// whose owner has the oldest dispatch credit wins; ties keep FIFO.
+	for _, cloudWanted := range []bool{true, false} {
+		var chosen *subT
+		chosenCredit := int64(0)
+		for cur := n.next; cur != n; cur = cur.next {
+			if _, ignored := skip[cur.owner]; ignored {
+				continue
+			}
+			if cloudPolicy[cur.policyID] != cloudWanted {
+				continue
+			}
+			if chosen == nil || lastServed[cur.owner] < chosenCredit {
+				chosen = cur
+				chosenCredit = lastServed[cur.owner]
+			}
+		}
+		if chosen != nil {
+			chosen.unlink()
+			return chosen
+		}
+	}
+	return nil
 }
 
 func (n *subT) isUpdate(policy *model.Policy) bool {

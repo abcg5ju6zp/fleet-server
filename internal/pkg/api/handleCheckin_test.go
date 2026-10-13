@@ -34,6 +34,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/es"
 	"github.com/elastic/fleet-server/v7/internal/pkg/model"
 	"github.com/elastic/fleet-server/v7/internal/pkg/policy"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 	"github.com/elastic/fleet-server/v7/internal/pkg/sqn"
 	ftesting "github.com/elastic/fleet-server/v7/internal/pkg/testing"
 	testcache "github.com/elastic/fleet-server/v7/internal/pkg/testing/cache"
@@ -55,8 +56,8 @@ func (m *mockPolicyMonitor) Run(ctx context.Context) error {
 	return args.Error(0)
 }
 
-func (m *mockPolicyMonitor) Subscribe(agentID, policyID string, revIDX int64) (policy.Subscription, error) {
-	args := m.Called(agentID, policyID, revIDX)
+func (m *mockPolicyMonitor) Subscribe(agentID, policyID string, revIDX int64, owner tenant.Owner) (policy.Subscription, error) {
+	args := m.Called(agentID, policyID, revIDX, owner)
 	return args.Get(0).(policy.Subscription), args.Error(1)
 }
 
@@ -628,7 +629,7 @@ func TestProcessUpgradeDetails(t *testing.T) {
 		cache: func() *testcache.MockCache {
 			mCache := testcache.NewMockCache()
 			mCache.On("GetAction", "test-action").Return(model.Action{}, false)
-			mCache.On("SetAction", mock.Anything)
+			mCache.On("SetAction", mock.Anything, mock.Anything)
 			return mCache
 		},
 		err: nil,

@@ -12,11 +12,20 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
 )
 
-func newCache(cfg config.Cache) (Cacher, error) {
+// fairEvictionAccounting reports whether the underlying cache emits
+// exit callbacks, which the per-owner cost accounting relies on.
+const fairEvictionAccounting = true
+
+func newCache(cfg config.Cache, exit onExit) (Cacher, error) {
 	rcfg := &ristretto.Config[string, any]{
 		NumCounters: cfg.NumCounters,
 		MaxCost:     cfg.MaxCost,
 		BufferItems: 64,
+		OnExit: func(val any) {
+			if exit != nil {
+				exit(val)
+			}
+		},
 	}
 
 	return ristretto.NewCache(rcfg)

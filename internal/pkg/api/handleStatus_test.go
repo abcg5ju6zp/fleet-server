@@ -17,6 +17,7 @@ import (
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
 	"github.com/elastic/elastic-agent-client/v7/pkg/proto"
 	"github.com/elastic/fleet-server/v7/internal/pkg/apikey"
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	fbuild "github.com/elastic/fleet-server/v7/internal/pkg/build"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
@@ -125,4 +126,145 @@ func TestHandleStatus(t *testing.T) {
 			}
 		})
 	}
+}
+
+func statusRegistry(enabled bool) *budget.Registry {
+	cfg := budget.Config{
+		Enabled:          enabled,
+		IdleTTL:          time.Hour,
+		ReclaimTTL:       time.Minute,
+		MaxTrackedOwners: 10,
+	}
+	// Mirrors production wiring: no resources are registered while the
+	// master switch is off.
+	if enabled {
+		cfg.Resources = map[budget.Resource]budget.ResourceConfig{
+			budget.ResourceCheckin: {Enabled: true, Capacity: 4, GuaranteeMin: 1, GuaranteeMax: 4, BorrowMax: 4},
+		}
+	}
+	return budget.New(cfg)
+}
+
+// TR-13.1: authenticated responses carry the budget section and its values
+// match the registry snapshot.
+func TestHandleStatusBudgetSectionAuthenticated(t *testing.T) {
+	ctx := testlog.SetLogger(t).WithContext(context.Background())
+	cfg := &config.Server{}
+	cfg.InitDefaults()
+	c, err := cache.New(config.Cache{NumCounters: 100, MaxCost: 100000})
+	require.NoError(t, err)
+
+	reg := statusRegistry(true)
+	lease, err := reg.TryAcquire(budget.ResourceCheckin, "ns-a")
+	require.NoError(t, err)
+	defer lease.Release()
+	// Rejected admission shows up in the section too.
+	_, err = reg.TryAcquire(budget.ResourceCheckin, "ns-a")
+	require.NoError(t, err)
+	_, err = reg.TryAcquire(budget.ResourceCheckin, "ns-a")
+	require.NoError(t, err)
+	_, err = reg.TryAcquire(budget.ResourceCheckin, "ns-a")
+	require.NoError(t, err)
+	_, err = reg.TryAcquire(budget.ResourceCheckin, "ns-b")
+	require.Error(t, err)
+
+	st := NewStatusT(cfg, nil, c,
+		withAuthFunc(func(*http.Request) (*apikey.APIKey, error) { return nil, nil }),
+		WithSelfMonitor(&mockStatusPolicyMonitor{state: client.UnitStateHealthy}),
+		WithStatusBudgets(reg),
+	)
+	r := apiServer{st: st}
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/api/status", nil)
+	Handler(&r).ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+	section, ok := raw["namespace_budgets"]
+	require.True(t, ok, "authenticated status must include the budget section")
+
+	var snap budget.Snapshot
+	require.NoError(t, json.Unmarshal(section, &snap))
+	assert.True(t, snap.Enabled)
+	require.Len(t, snap.Resource, 1)
+	rs := snap.Resource[0]
+	assert.Equal(t, budget.ResourceCheckin, rs.Resource)
+	assert.Equal(t, int64(4), rs.Capacity)
+	assert.Equal(t, int64(4), rs.InUse)
+
+	var a budget.OwnerSnapshot
+	for _, os := range rs.Owners {
+		if os.Owner == "ns-a" {
+			a = os
+		}
+	}
+	assert.Equal(t, int64(4), a.InUse)
+	assert.Equal(t, int64(0), a.Rejected[budget.ReasonMax]) // ns-a admits never rejected
+	var bRejects int64
+	for _, os := range rs.Owners {
+		if os.Owner == "ns-b" {
+			bRejects = os.Rejected[budget.ReasonMax]
+		}
+	}
+	assert.Equal(t, int64(1), bRejects)
+}
+
+// TR-13.1: the unauthenticated response is unchanged and exposes no budget
+// detail.
+func TestHandleStatusBudgetSectionUnauthenticatedHidden(t *testing.T) {
+	ctx := testlog.SetLogger(t).WithContext(context.Background())
+	cfg := &config.Server{}
+	cfg.InitDefaults()
+	c, err := cache.New(config.Cache{NumCounters: 100, MaxCost: 100000})
+	require.NoError(t, err)
+
+	reg := statusRegistry(true)
+	st := NewStatusT(cfg, nil, c,
+		withAuthFunc(func(*http.Request) (*apikey.APIKey, error) { return nil, apikey.ErrNoAuthHeader }),
+		WithSelfMonitor(&mockStatusPolicyMonitor{state: client.UnitStateHealthy}),
+		WithStatusBudgets(reg),
+	)
+	r := apiServer{st: st}
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/api/status", nil)
+	Handler(&r).ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+	_, hasBudgets := raw["namespace_budgets"]
+	assert.False(t, hasBudgets)
+	_, hasVersion := raw["version"]
+	assert.False(t, hasVersion)
+}
+
+// When the feature switch is off the authenticated section reports the
+// disabled baseline and no managed resources.
+func TestHandleStatusBudgetSectionDisabled(t *testing.T) {
+	ctx := testlog.SetLogger(t).WithContext(context.Background())
+	cfg := &config.Server{}
+	cfg.InitDefaults()
+	c, err := cache.New(config.Cache{NumCounters: 100, MaxCost: 100000})
+	require.NoError(t, err)
+
+	reg := statusRegistry(false)
+	st := NewStatusT(cfg, nil, c,
+		withAuthFunc(func(*http.Request) (*apikey.APIKey, error) { return nil, nil }),
+		WithSelfMonitor(&mockStatusPolicyMonitor{state: client.UnitStateHealthy}),
+		WithStatusBudgets(reg),
+	)
+	r := apiServer{st: st}
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/api/status", nil)
+	Handler(&r).ServeHTTP(w, req)
+
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+	section, ok := raw["namespace_budgets"]
+	require.True(t, ok)
+	var snap budget.Snapshot
+	require.NoError(t, json.Unmarshal(section, &snap))
+	assert.False(t, snap.Enabled)
+	assert.Empty(t, snap.Resource)
 }

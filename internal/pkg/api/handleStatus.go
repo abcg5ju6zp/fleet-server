@@ -16,12 +16,14 @@ import (
 	"github.com/elastic/elastic-agent-client/v7/pkg/client"
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/apikey"
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/build"
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
 	"github.com/elastic/fleet-server/v7/internal/pkg/logger"
 	"github.com/elastic/fleet-server/v7/internal/pkg/policy"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 
 	"github.com/rs/zerolog"
 )
@@ -30,15 +32,24 @@ const (
 	kStatusMod = "status"
 )
 
+// statusResponse extends the generated status body for authenticated callers
+// with the explainable namespace-budget section. The generated type is not
+// hand-edited; the extra field is added only at the response boundary.
+type statusResponse struct {
+	StatusAPIResponse
+	NamespaceBudgets *budget.Snapshot `json:"namespace_budgets,omitempty"`
+}
+
 type AuthFunc func(*http.Request) (*apikey.APIKey, error)
 
 type StatusT struct {
-	cfg    *config.Server
-	bulk   bulk.Bulk
-	cache  cache.Cache
-	sm     policy.SelfMonitor
-	bi     build.Info
-	authfn AuthFunc
+	cfg     *config.Server
+	bulk    bulk.Bulk
+	cache   cache.Cache
+	sm      policy.SelfMonitor
+	bi      build.Info
+	authfn  AuthFunc
+	budgets *budget.Registry
 }
 
 type OptFunc func(*StatusT)
@@ -84,22 +95,43 @@ func (st StatusT) handleStatus(zlog zerolog.Logger, r *http.Request, w http.Resp
 		authed = false
 	}
 
+	// Authenticated status requests share the identity-less default bucket;
+	// unauthenticated ones stay outside namespace accounting entirely.
+	if authed {
+		var lease budget.Lease
+		var admitted bool
+		if _, lease, admitted = acquireTenantBudget(r, w, st.budgets, budget.ResourceStatus, tenant.Default); !admitted {
+			return nil
+		}
+		defer lease.Release()
+	}
+
 	span, ctx := apm.StartSpan(r.Context(), "getState", "process")
 	state := st.sm.State()
-	resp := StatusAPIResponse{
-		Name:   build.ServiceName,
-		Status: StatusResponseStatus(state.String()), // TODO try to make the oapi codegen less verbose here
+	out := statusResponse{
+		StatusAPIResponse: StatusAPIResponse{
+			Name:   build.ServiceName,
+			Status: StatusResponseStatus(state.String()), // TODO try to make the oapi codegen less verbose here
+		},
 	}
 
 	if authed {
 		sSpan, _ := apm.StartSpan(ctx, "getVersion", "process")
 		bt := st.bi.BuildTime.Format(time.RFC3339)
-		resp.Version = &StatusResponseVersion{
+		out.Version = &StatusResponseVersion{
 			Number:    &st.bi.Version,
 			BuildHash: &st.bi.Commit,
 			BuildTime: &bt,
 		}
 		sSpan.End()
+
+		// The explainable budget section is authenticated-only; the
+		// unauthenticated short response stays byte-identical. A disabled
+		// registry still reports its effective state (enabled=false).
+		if st.budgets != nil {
+			snap := st.budgets.Snapshot()
+			out.NamespaceBudgets = &snap
+		}
 	}
 	span.End()
 
@@ -112,7 +144,7 @@ func (st StatusT) handleStatus(zlog zerolog.Logger, r *http.Request, w http.Resp
 		state = client.UnitStateStopping
 	}
 
-	data, err := json.Marshal(&resp)
+	data, err := json.Marshal(&out)
 	if err != nil {
 		return err
 	}

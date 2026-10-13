@@ -104,6 +104,7 @@ type (
 		PGP                PGP                     `config:"pgp"`
 		PDKDF2             PBKDF2                  `config:"pdkdf2"`
 		Features           FeatureFlags            `config:"feature_flags"`
+		NamespaceBudgets   ServerNamespaceBudgets  `config:"namespace_budgets"`
 	}
 
 	StaticPolicyTokens struct {
@@ -170,6 +171,7 @@ func (c *Server) InitDefaults() {
 	c.GC.InitDefaults()
 	c.PGP.InitDefaults()
 	c.PDKDF2.InitDefaults()
+	c.NamespaceBudgets.InitDefaults()
 	c.Features.EnableOpAMP = true
 	c.Features.GracefulForceUnenroll.MaxBytes = DefaultGracefulForceUnenrollMaxBytes
 }
@@ -229,6 +231,12 @@ func (c *Input) InitDefaults() {
 func (c *Input) Validate() error {
 	if c.Type != fleetInputType {
 		return fmt.Errorf("input type must be %q", fleetInputType)
+	}
+	if err := c.Server.Limits.Validate(); err != nil {
+		return err
+	}
+	if err := c.Server.NamespaceBudgets.Validate(); err != nil {
+		return err
 	}
 	return nil
 }

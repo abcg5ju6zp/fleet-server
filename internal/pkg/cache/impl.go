@@ -12,5 +12,12 @@ type Cacher interface {
 	Get(key string) (any, bool)
 	Set(key string, value any, cost int64) bool
 	SetWithTTL(key string, value any, cost int64, ttl time.Duration) bool
+	Del(key string)
 	Close()
 }
+
+// onExit is called with the stored value of an entry when it leaves the
+// cache for any reason (eviction, TTL expiry, explicit delete, admission
+// rejection or replacement). The fair cache uses it to return the entry's
+// weighted cost lease to its owner. It must never block.
+type onExit func(value any)

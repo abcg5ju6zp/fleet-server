@@ -15,8 +15,10 @@ import (
 	"go.elastic.co/apm/v2"
 	"golang.org/x/time/rate"
 
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 	"github.com/elastic/fleet-server/v7/internal/pkg/dl"
 	"github.com/elastic/fleet-server/v7/internal/pkg/es"
 	"github.com/elastic/fleet-server/v7/internal/pkg/logger/ecs"
@@ -61,7 +63,7 @@ type Monitor interface {
 	Run(ctx context.Context) error
 
 	// Subscribe creates a new subscription for a policy update.
-	Subscribe(agentID string, policyID string, revisionIdx int64) (Subscription, error)
+	Subscribe(agentID string, policyID string, revisionIdx int64, owner tenant.Owner) (Subscription, error)
 
 	// Unsubscribe removes the current subscription.
 	Unsubscribe(sub Subscription) error
@@ -97,12 +99,30 @@ type monitorT struct {
 	policyF       policyFetcher
 	policiesIndex string
 	limit         *rate.Limiter
+	budgets       *budget.Registry
+
+	// Per-owner fair dispatch: lastServed is a monotonically stamped
+	// dispatch credit; the pending queue always serves the waiting
+	// owner with the oldest credit next.
+	deploySeq      int64
+	lastServed     map[tenant.Owner]int64
 
 	startCh chan struct{}
 }
 
+// MonitorOption configures a Monitor at construction.
+type MonitorOption func(*monitorT)
+
+// WithBudgets injects the namespace budget registry for fair policy
+// dispatch scheduling.
+func WithBudgets(r *budget.Registry) MonitorOption {
+	return func(m *monitorT) {
+		m.budgets = r
+	}
+}
+
 // NewMonitor creates the policy monitor for subscribing agents.
-func NewMonitor(bulker bulk.Bulk, monitor monitor.Monitor, cfg config.ServerLimits) Monitor {
+func NewMonitor(bulker bulk.Bulk, monitor monitor.Monitor, cfg config.ServerLimits, opts ...MonitorOption) Monitor {
 	burst := cfg.PolicyLimit.Burst
 	interval := rate.Every(cfg.PolicyLimit.Interval)
 	if cfg.PolicyLimit.Burst <= 0 {
@@ -111,7 +131,7 @@ func NewMonitor(bulker bulk.Bulk, monitor monitor.Monitor, cfg config.ServerLimi
 	if cfg.PolicyLimit.Interval <= 0 {
 		interval = rate.Every(time.Nanosecond) // set minimal spin rate
 	}
-	return &monitorT{
+	m := &monitorT{
 		bulker:        bulker,
 		monitor:       monitor,
 		kickCh:        make(chan struct{}, 1),
@@ -121,8 +141,13 @@ func NewMonitor(bulker bulk.Bulk, monitor monitor.Monitor, cfg config.ServerLimi
 		limit:         rate.NewLimiter(interval, burst),
 		policyF:       dl.QueryLatestPolicies,
 		policiesIndex: dl.FleetPolicies,
+		lastServed:    make(map[tenant.Owner]int64),
 		startCh:       make(chan struct{}),
 	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
 }
 
 // endTrans is a convenience function to end the passed transaction if it's not nil
@@ -240,32 +265,61 @@ func (m *monitorT) waitStart(ctx context.Context) error {
 	return nil
 }
 
-// dispatchPending will dispatch all pending policy changes to the subscriptions in the queue.
-// dispatches are rate limited by the monitor's limiter.
+// dispatchPending dispatches pending policy changes to subscriptions.
+// Ordering is per-owner fair (DRR by last-served credit) instead of
+// strict global FIFO, so a namespace with many pending policy updates
+// cannot starve another namespace's single update. Cloud policy keeps
+// priority. Each dispatch is rate limited and admitted against the
+// policy_dispatch namespace budget; rejected owners are skipped for
+// this round (their subscription is pushed back and retried on the
+// next deploy kick).
 func (m *monitorT) dispatchPending(ctx context.Context) {
 	span, ctx := apm.StartSpan(ctx, "dispatch pending", "dispatch")
 	defer span.End()
 
 	ts := time.Now()
 	nQueued := 0
+	skipped := map[tenant.Owner]struct{}{}
+	cloudPolicies := map[string]bool{cloudPolicyID: true}
 
-	// Hold m.mut only for queue/map access; release before rate-limiting,
-	// Clone(), and channel sends so Subscribe/Unsubscribe/updatePolicy are
-	// not blocked during those potentially slow operations.
-	m.mut.Lock()
-	s := m.pendingQ.popFront()
-	m.mut.Unlock()
+	for {
+		// Hold m.mut only for queue/map access; release before rate-limiting,
+		// Clone(), and channel sends so Subscribe/Unsubscribe/updatePolicy are
+		// not blocked during those potentially slow operations.
+		m.mut.Lock()
+		s := m.pendingQ.popFair(cloudPolicies, m.lastServed, skipped)
+		m.mut.Unlock()
 
-	if s == nil {
-		return
-	}
+		if s == nil {
+			break
+		}
 
-	for s != nil {
+		// Namespace fair-share admission; a backed-off or saturated
+		// owner leaves its subscription queued and lets other owners
+		// take this round.
+		var lease budget.Lease
+		if m.budgets != nil {
+			l, berr := m.budgets.TryAcquire(budget.ResourcePolicyDispatch, s.owner)
+			if berr != nil {
+				m.mut.Lock()
+				m.pendingQ.pushFront(s)
+				m.mut.Unlock()
+				skipped[s.owner] = struct{}{}
+				continue
+			}
+			lease = l
+		}
+
 		// Use a rate.Limiter to control how fast policies are passed to the checkin handler.
 		// This is done to avoid all responses to agents on the same policy from being written at once.
 		// If too many (checkin) responses are written concurrently memory usage may explode due to allocating gzip writers.
 		err := m.limit.Wait(ctx)
 		if err != nil {
+			if lease != nil {
+			if lease != nil {
+		lease.Release()
+	}
+		}
 			// Wait can also fail without ctx being done (e.g. the wait would exceed ctx's deadline).
 			m.mut.Lock()
 			m.pendingQ.pushFront(s) // context cancelled before sub is handled, put it back
@@ -284,6 +338,11 @@ func (m *monitorT) dispatchPending(ctx context.Context) {
 		m.mut.Unlock()
 
 		if !ok {
+			if lease != nil {
+			if lease != nil {
+		lease.Release()
+	}
+		}
 			m.log.Warn().
 				Str(ecs.PolicyID, s.policyID).
 				Msg("logic error: policy missing on dispatch")
@@ -292,6 +351,11 @@ func (m *monitorT) dispatchPending(ctx context.Context) {
 
 		// Clone and send without holding m.mut.
 		if err := ctx.Err(); err != nil {
+			if lease != nil {
+			if lease != nil {
+		lease.Release()
+	}
+		}
 			m.mut.Lock()
 			m.pendingQ.pushFront(s) // context cancelled before sub is handled, put it back
 			m.mut.Unlock()
@@ -301,6 +365,11 @@ func (m *monitorT) dispatchPending(ctx context.Context) {
 		cloned := policy.pp.Clone()
 		select {
 		case <-ctx.Done():
+			if lease != nil {
+			if lease != nil {
+		lease.Release()
+	}
+		}
 			m.mut.Lock()
 			m.pendingQ.pushFront(s) // context cancelled before sub is handled, put it back
 			m.mut.Unlock()
@@ -311,8 +380,14 @@ func (m *monitorT) dispatchPending(ctx context.Context) {
 				Str(ecs.PolicyID, s.policyID).
 				Int64("subscription_revision_idx", s.revIdx).
 				Int64(ecs.RevisionIdx, s.revIdx).
+				Str("owner", string(s.owner)).
 				Msg("dispatch policy change")
 		default:
+			if lease != nil {
+			if lease != nil {
+		lease.Release()
+	}
+		}
 			// Should never block on a channel; we created a channel of size one.
 			// A block here indicates a logic error somewheres.
 			m.log.Error().
@@ -321,16 +396,24 @@ func (m *monitorT) dispatchPending(ctx context.Context) {
 				Msg("logic error: should never block on policy channel")
 			return
 		}
+		if lease != nil {
+			if lease != nil {
+		lease.Release()
+	}
+		}
 
 		m.mut.Lock()
-		s = m.pendingQ.popFront()
+		m.deploySeq++
+		m.lastServed[s.owner] = m.deploySeq
 		m.mut.Unlock()
 		nQueued++
 	}
 
-	dur := time.Since(ts)
-	m.log.Debug().Dur("event.duration", dur).Int("nSubs", nQueued).
-		Msg("policy monitor dispatch complete")
+	if nQueued > 0 {
+		dur := time.Since(ts)
+		m.log.Debug().Dur("event.duration", dur).Int("nSubs", nQueued).
+			Msg("policy monitor dispatch complete")
+	}
 }
 
 func (m *monitorT) loadPolicies(ctx context.Context) error {
@@ -510,20 +593,25 @@ func (m *monitorT) kickDeploy() {
 }
 
 // Subscribe creates a new subscription for a policy update.
-func (m *monitorT) Subscribe(agentID string, policyID string, revisionIdx int64) (Subscription, error) {
+func (m *monitorT) Subscribe(agentID string, policyID string, revisionIdx int64, owner tenant.Owner) (Subscription, error) {
 	if revisionIdx < 0 {
 		return nil, errors.New("revisionIdx must be greater than or equal to 0")
+	}
+	if owner == "" {
+		owner = tenant.Default
 	}
 	m.log.Debug().
 		Str(ecs.AgentID, agentID).
 		Str(ecs.PolicyID, policyID).
 		Int64(ecs.RevisionIdx, revisionIdx).
+		Str("owner", string(owner)).
 		Msg("subscribed to policy monitor")
 
 	s := NewSub(
 		policyID,
 		agentID,
 		revisionIdx,
+		owner,
 	)
 
 	m.mut.Lock()

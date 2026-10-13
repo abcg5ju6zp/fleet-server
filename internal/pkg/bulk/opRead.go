@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/elastic/go-elasticsearch/v8/esapi"
@@ -168,6 +169,10 @@ func (b *Bulker) flushRead(ctx context.Context, queue queueT) error {
 	for i := range blk.Items {
 		next := n.next // 'n' is invalid immediately on channel send
 		item := &blk.Items[i]
+		n.releaseOwnerLeases()
+		if item.Found {
+			b.reportOwnerItem(n, http.StatusOK)
+		}
 		select {
 		case n.ch <- respT{
 			err:  item.deriveError(),

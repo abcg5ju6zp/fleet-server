@@ -9,6 +9,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
 	"github.com/elastic/fleet-server/v7/internal/pkg/file"
 	"github.com/elastic/fleet-server/v7/internal/pkg/model"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -25,8 +26,8 @@ func (m *MockCache) Reconfigure(cfg config.Cache) error {
 	return args.Error(0)
 }
 
-func (m *MockCache) SetAction(action model.Action) {
-	m.Called(action)
+func (m *MockCache) SetAction(action model.Action, owner tenant.Owner) {
+	m.Called(action, owner)
 }
 
 func (m *MockCache) GetAction(id string) (model.Action, bool) {
@@ -43,8 +44,8 @@ func (m *MockCache) ValidAPIKey(key corecache.APIKey) bool {
 	return args.Bool(0)
 }
 
-func (m *MockCache) SetEnrollmentAPIKey(id string, key model.EnrollmentAPIKey, cost int64) {
-	m.Called(id, key, cost)
+func (m *MockCache) SetEnrollmentAPIKey(id string, key model.EnrollmentAPIKey, cost int64, owner tenant.Owner) {
+	m.Called(id, key, cost, owner)
 }
 
 func (m *MockCache) GetEnrollmentAPIKey(id string) (model.EnrollmentAPIKey, bool) {
@@ -52,8 +53,8 @@ func (m *MockCache) GetEnrollmentAPIKey(id string) (model.EnrollmentAPIKey, bool
 	return args.Get(0).(model.EnrollmentAPIKey), args.Bool(1)
 }
 
-func (m *MockCache) SetArtifact(artifact model.Artifact) {
-	m.Called(artifact)
+func (m *MockCache) SetArtifact(artifact model.Artifact, owner tenant.Owner) {
+	m.Called(artifact, owner)
 }
 
 func (m *MockCache) GetArtifact(ident, sha2 string) (model.Artifact, bool) {
@@ -61,8 +62,8 @@ func (m *MockCache) GetArtifact(ident, sha2 string) (model.Artifact, bool) {
 	return args.Get(0).(model.Artifact), args.Bool(1)
 }
 
-func (m *MockCache) SetUpload(id string, info file.Info) {
-	m.Called(id, info)
+func (m *MockCache) SetUpload(id string, info file.Info, owner tenant.Owner) {
+	m.Called(id, info, owner)
 }
 
 func (m *MockCache) GetUpload(id string) (file.Info, bool) {

@@ -230,6 +230,44 @@ fleet:
 #         max: 50
 #         max_body_byte_size: 1024
 #
+#     # namespace_budgets enables per-namespace fair-share accounting on top
+#     # of the global limits above. Each authenticated request is attributed
+#     # to its agent/enrollment-key namespaces (agents without namespaces use
+#     # the shared "default" bucket). Each namespace gets a guaranteed share
+#     # of every managed resource; idle share can be borrowed and is reclaimed
+#     # under contention (in-flight requests are never preempted). Rejections
+#     # keep the existing 429 semantics and add a Retry-After hint. A single
+#     # namespace deployment behaves identically with the feature enabled.
+#     namespace_budgets:
+#       # enabled: true
+#       # Guarantee clamps (in the resource's own units: concurrency
+#       # slots for routes/queues, bytes for cache_cost).
+#       # guarantee_min: 0
+#       # guarantee_max: 0
+#       # borrow_max_ratio: 1.0
+#       # idle_ttl: 10m
+#       # reclaim_ttl: 30s
+#       # max_tracked_namespaces: 1000
+#       # backoff:
+#       #   initial: 1s
+#       #   max: 30s
+#       #   failure_threshold: 5
+#       # Per-resource tuning; keys: checkin, ack, artifact, enroll,
+#       # status, opamp, upload_begin, upload_chunk, upload_complete,
+#       # file_delivery, pgp, audit_unenroll, bulk_dispatch, bulk_flush,
+#       # policy_dispatch, action_dispatch, action_fanout, cache_cost.
+#       # resources:
+#       #   checkin:
+#       #     enabled: true
+#       #     guarantee_min: 1
+#       #     guarantee_max: 0
+#       #     borrow_max_ratio: 1
+#       # overrides pin weight or a fixed guarantee per namespace owner:
+#       # overrides:
+#       #   production:
+#       #     weight: 3
+#       #     guarantee: 100
+#
 #     # go runtime limits
 #     runtime:
 #       gc_percent: 0

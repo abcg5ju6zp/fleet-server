@@ -21,6 +21,7 @@ import (
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/action"
 	"github.com/elastic/fleet-server/v7/internal/pkg/api"
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/build"
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
@@ -51,6 +52,7 @@ type Fleet struct {
 
 	cfgCh    chan *config.Config
 	cache    cache.Cache
+	budgets  *budget.Registry
 	reporter state.Reporter
 
 	// Used for diagnostics reporting
@@ -103,11 +105,28 @@ func (f *Fleet) Run(ctx context.Context, initCfg *config.Config) error {
 	}
 	cacheCfg := config.CopyCache(initCfg)
 	log.Info().Interface("cfg", cacheCfg).Msg("Setting cache config options")
-	cache, err := cache.New(cacheCfg, cache.WithLog(log))
+
+	// The namespace budget registry is a process-long singleton that
+	// survives the stop/start of runServer on configuration changes;
+	// only its parameters are re-applied in place below. It is created
+	// before the cache so the cache-cost resource can share it.
+	f.budgets = budget.New(buildBudgetConfig(initCfg))
+	go f.budgets.Run(ctx)
+	log.Info().
+		Int("resources", len(buildBudgetConfig(initCfg).Resources)).
+		Bool("enabled", initCfg.Inputs[0].Server.NamespaceBudgets.Enabled).
+		Msg("namespace budget registry initialized")
+
+	cache, err := cache.New(cacheCfg, cache.WithLog(log), cache.WithBudgets(f.budgets))
 	if err != nil {
 		return err
 	}
 	f.cache = cache
+
+	// Expose per-namespace budget and cache metrics on /metrics. Safe to
+	// call across Fleet.Run executions: collector registration happens
+	// exactly once, only the sources are rebound.
+	api.EnableNamespaceBudgetMetrics(f.budgets, cache)
 
 	var curCfg *config.Config
 	newCfg := initCfg
@@ -158,6 +177,13 @@ LOOP:
 		err := newCfg.LoadServerLimits(log)
 		if err != nil {
 			return fmt.Errorf("encountered error while loading server limits: %w", err)
+		}
+
+		// Apply budget parameters in place; the registry instance and its
+		// in-flight leases survive the server restart below.
+		if f.budgets != nil && configChangedBudgets(curCfg, newCfg) {
+			log.Info().Msg("reconfiguring namespace budgets on configuration change")
+			f.budgets.Reconfigure(buildBudgetConfig(newCfg))
 		}
 
 		// Create or recreate cache
@@ -256,6 +282,13 @@ func configCacheChanged(curCfg, newCfg *config.Config) bool {
 	return curCfg.Inputs[0].Cache != newCfg.Inputs[0].Cache
 }
 
+func configChangedBudgets(curCfg, newCfg *config.Config) bool {
+	if curCfg == nil {
+		return true
+	}
+	return !reflect.DeepEqual(curCfg.Inputs[0].Server.NamespaceBudgets, newCfg.Inputs[0].Server.NamespaceBudgets)
+}
+
 func configChangedServer(zlog zerolog.Logger, curCfg, newCfg *config.Config) bool {
 	changed := true
 	switch {
@@ -343,6 +376,9 @@ func (f *Fleet) initBulker(ctx context.Context, tracer *apm.Tracer, cfg *config.
 
 	bulkOpts := bulk.BulkOptsFromCfg(cfg)
 	bulkOpts = append(bulkOpts, bulk.WithBi(f.bi))
+	if f.budgets != nil {
+		bulkOpts = append(bulkOpts, bulk.WithBudgets(f.budgets))
+	}
 	blk := bulk.NewBulker(es, tracer, bulkOpts...)
 	return blk, nil
 }
@@ -496,7 +532,7 @@ func (f *Fleet) runSubsystems(ctx context.Context, cfg *config.Config, g *errgro
 	g.Go(loggedRunFunc(ctx, "Policy index monitor", pim.Run))
 
 	// Policy monitor
-	pm := policy.NewMonitor(bulker, pim, cfg.Inputs[0].Server.Limits)
+	pm := policy.NewMonitor(bulker, pim, cfg.Inputs[0].Server.Limits, policy.WithBudgets(f.budgets))
 	g.Go(loggedRunFunc(ctx, "Policy monitor", pm.Run))
 
 	// Policy self monitor
@@ -520,7 +556,7 @@ func (f *Fleet) runSubsystems(ctx context.Context, cfg *config.Config, g *errgro
 	}
 	g.Go(loggedRunFunc(ctx, "Action monitor", am.Run))
 
-	ad := action.NewDispatcher(am, cfg.Inputs[0].Server.Limits.ActionLimit.Interval, cfg.Inputs[0].Server.Limits.ActionLimit.Burst, bulker)
+	ad := action.NewDispatcher(am, cfg.Inputs[0].Server.Limits.ActionLimit.Interval, cfg.Inputs[0].Server.Limits.ActionLimit.Burst, bulker, action.WithBudgets(f.budgets))
 	g.Go(loggedRunFunc(ctx, "Action dispatcher", ad.Run))
 
 	bc := checkin.NewBulk(bulker)
@@ -541,25 +577,36 @@ func (f *Fleet) runSubsystems(ctx context.Context, cfg *config.Config, g *errgro
 	}))
 
 	ct, err := api.NewCheckinT(f.verCon, &cfg.Inputs[0].Server, f.cache, bc, pm, am, ad, bulker,
-		api.WithOutputSecretCandidateCollector(outputSecretReconciler))
+		api.WithOutputSecretCandidateCollector(outputSecretReconciler),
+		api.WithCheckinBudgets(f.budgets),
+	)
 	if err != nil {
 		return err
 	}
 	f.checkinT = ct
 	g.Go(loggedRunFunc(ctx, "Invalid API key state cleaner", ct.RunInvalidKeyStateCleaner))
-	et, err := api.NewEnrollerT(f.verCon, &cfg.Inputs[0].Server, bulker, f.cache)
+	et, err := api.NewEnrollerT(f.verCon, &cfg.Inputs[0].Server, bulker, f.cache,
+		api.WithEnrollerBudgets(f.budgets))
 	if err != nil {
 		return err
 	}
 
-	at := api.NewArtifactT(&cfg.Inputs[0].Server, bulker, f.cache, pm)
-	ack := api.NewAckT(&cfg.Inputs[0].Server, bulker, f.cache)
-	st := api.NewStatusT(&cfg.Inputs[0].Server, bulker, f.cache, api.WithSelfMonitor(sm), api.WithBuildInfo(f.bi))
-	oa := api.NewOpAMPT(ctx, &cfg.Inputs[0].Server, bulker, f.cache, bc)
-	ut := api.NewUploadT(&cfg.Inputs[0].Server, bulker, monCli, f.cache) // uses no-retry client for bufferless chunk upload
-	ft := api.NewFileDeliveryT(&cfg.Inputs[0].Server, bulker, monCli, f.cache)
-	pt := api.NewPGPRetrieverT(&cfg.Inputs[0].Server, bulker, f.cache)
-	auditT := api.NewAuditT(&cfg.Inputs[0].Server, bulker, f.cache)
+	at := api.NewArtifactT(&cfg.Inputs[0].Server, bulker, f.cache, pm,
+		api.WithArtifactBudgets(f.budgets))
+	ack := api.NewAckT(&cfg.Inputs[0].Server, bulker, f.cache,
+		api.WithAckBudgets(f.budgets))
+	st := api.NewStatusT(&cfg.Inputs[0].Server, bulker, f.cache, api.WithSelfMonitor(sm), api.WithBuildInfo(f.bi),
+		api.WithStatusBudgets(f.budgets))
+	oa := api.NewOpAMPT(ctx, &cfg.Inputs[0].Server, bulker, f.cache, bc,
+		api.WithOpAMPBudgets(f.budgets))
+	ut := api.NewUploadT(&cfg.Inputs[0].Server, bulker, monCli, f.cache, // uses no-retry client for bufferless chunk upload
+		api.WithUploadBudgets(f.budgets))
+	ft := api.NewFileDeliveryT(&cfg.Inputs[0].Server, bulker, monCli, f.cache,
+		api.WithFileDeliveryBudgets(f.budgets))
+	pt := api.NewPGPRetrieverT(&cfg.Inputs[0].Server, bulker, f.cache,
+		api.WithPGPBudgets(f.budgets))
+	auditT := api.NewAuditT(&cfg.Inputs[0].Server, bulker, f.cache,
+		api.WithAuditBudgets(f.budgets))
 
 	if err := oa.Init(); err != nil {
 		return fmt.Errorf("failed to initialize opamp: %w", err)
@@ -578,6 +625,7 @@ func (f *Fleet) runSubsystems(ctx context.Context, cfg *config.Config, g *errgro
 			api.WithPGP(pt),
 			api.WithAudit(auditT),
 			api.WithTracer(tracer),
+			api.WithBudgets(f.budgets),
 		)
 		g.Go(loggedRunFunc(ctx, "Http server", func(ctx context.Context) error {
 			return apiServer.Run(ctx)

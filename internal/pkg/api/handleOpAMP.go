@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -27,6 +28,7 @@ import (
 	"github.com/elastic/elastic-agent-libs/redact"
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/apikey"
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/checkin"
@@ -35,6 +37,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/es"
 	"github.com/elastic/fleet-server/v7/internal/pkg/limit"
 	"github.com/elastic/fleet-server/v7/internal/pkg/model"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 )
 
 const (
@@ -56,6 +59,82 @@ type OpAMPT struct {
 	srv     oaServer.OpAMPServer
 	handler oaServer.HTTPHandlerFunc
 	connCtx oaServer.ConnContext
+
+	budgets *budget.Registry
+	// connLeases holds the one namespace budget lease per accepted
+	// connection; it is attributed to the default bucket at connect and
+	// transferred (once) to the enrolled/found agent's owner.
+	connLeases sync.Map // connKey(string) -> budget.Lease
+}
+
+func opAMPConnKey(conn types.Connection) (key string) {
+	// Test doubles may return typed-nil connections; fall back to a
+	// single shared key. Production connections always have a remote addr.
+	defer func() {
+		if r := recover(); r != nil {
+			key = ""
+		}
+	}()
+	if netConn := conn.Connection(); netConn != nil {
+		if addr := netConn.RemoteAddr(); addr != nil {
+			return addr.String()
+		}
+	}
+	return ""
+}
+
+func (oa *OpAMPT) acquireConnLease(conn types.Connection, owner tenant.Owner) budget.Lease {
+	if oa.budgets == nil {
+		return budget.NopLease(owner, budget.ResourceOpAMP)
+	}
+	lease, err := oa.budgets.TryAcquire(budget.ResourceOpAMP, owner)
+	if err != nil {
+		return nil
+	}
+	key := opAMPConnKey(conn)
+	if old, ok := oa.connLeases.Swap(key, lease); ok {
+		if l, ok := old.(budget.Lease); ok {
+			l.Release()
+		}
+	}
+	return lease
+}
+
+// transferConnLease moves the connection's lease from the default bucket
+// to the resolved owner; on rejection the established connection is closed.
+// Repeated transfers to the same owner are no-ops.
+func (oa *OpAMPT) transferConnLease(zlog zerolog.Logger, conn types.Connection, owner tenant.Owner) {
+	if old, ok := oa.connLeases.Load(opAMPConnKey(conn)); ok {
+		if l, ok := old.(budget.Lease); ok && l.Owner() == owner {
+			return
+		}
+	}
+	lease := oa.acquireConnLease(conn, owner)
+	if lease == nil {
+		zlog.Warn().Str("owner", string(owner)).Msg("opamp namespace budget rejected, closing connection")
+		_ = conn.Disconnect()
+		return
+	}
+	zlog.Debug().Str("owner", string(owner)).Msg("opamp connection attributed to namespace owner")
+}
+
+func (oa *OpAMPT) releaseConnLease(conn types.Connection) {
+	if old, ok := oa.connLeases.LoadAndDelete(opAMPConnKey(conn)); ok {
+		if l, ok := old.(budget.Lease); ok {
+			l.Release()
+		}
+	}
+}
+
+// connOwner returns the owner currently attributed to a connection.
+func (oa *OpAMPT) connOwner(conn types.Connection) tenant.Owner {
+	owner := tenant.Default
+	if v, ok := oa.connLeases.Load(opAMPConnKey(conn)); ok {
+		if l, ok := v.(budget.Lease); ok {
+			owner = l.Owner()
+		}
+	}
+	return owner
 }
 
 type checkinBulk interface {
@@ -68,6 +147,7 @@ func NewOpAMPT(
 	bulker bulk.Bulk,
 	cache cache.Cache,
 	bc *checkin.Bulk,
+	opts ...func(*OpAMPT),
 ) *OpAMPT {
 	oa := &OpAMPT{
 		cfg:         cfg,
@@ -76,6 +156,9 @@ func NewOpAMPT(
 		bc:          bc,
 		enrollLimit: limit.NewLimiter(&cfg.Limits.EnrollLimit),
 		srv:         oaServer.New(nil),
+	}
+	for _, opt := range opts {
+		opt(oa)
 	}
 
 	return oa
@@ -116,9 +199,14 @@ func (oa *OpAMPT) Init() error {
 				// Setup connection callbacks.
 				connectionCallbacks := types.ConnectionCallbacks{
 					OnConnected: func(ctx context.Context, conn types.Connection) {
+						// Claim the connection against the identity-less
+						// default bucket; it is transferred once the agent is
+						// resolved in the first message.
+						oa.acquireConnLease(conn, tenant.Default)
 						zlog.Debug().Msg("opAMP client connected")
 					},
 					OnConnectionClose: func(conn types.Connection) {
+						oa.releaseConnLease(conn)
 						zlog.Debug().Msg("opAMP client disconnected")
 					},
 					OnMessage: oa.handleMessage(zlog, apiKey),
@@ -189,6 +277,12 @@ func (oa *OpAMPT) handleMessage(zlog zerolog.Logger, apiKey *apikey.APIKey) func
 			Bool("enroll_request", enrollRequest).
 			Msg("agent enrollment check")
 
+		// Transfer the connection lease from the default bucket to the
+		// resolved agent's owner; one-shot per owner.
+		if agentFound {
+			oa.transferConnLease(zlog, conn, tenant.Canonical(agent.Namespaces))
+		}
+
 		// Handle agent disconnect: set status to offline for enrolled agents,
 		// return an error for unenrolled agents.
 		if message.AgentDisconnect != nil {
@@ -201,7 +295,7 @@ func (oa *OpAMPT) handleMessage(zlog zerolog.Logger, apiKey *apikey.APIKey) func
 				return response
 			}
 			zlog.Debug().Msg("agent_disconnect received")
-			if err := oa.bc.CheckIn(instanceUID.String(), checkin.WithStatus(string(CheckinRequestStatusDisconnected))); err != nil {
+			if err := oa.bc.CheckIn(instanceUID.String(), checkin.WithStatus(string(CheckinRequestStatusDisconnected)), checkin.WithOwner(oa.connOwner(conn))); err != nil {
 				zlog.Error().Err(err).Msg("checkin failed, disconnect status may be lost")
 			}
 			return response
@@ -231,6 +325,8 @@ func (oa *OpAMPT) handleMessage(zlog zerolog.Logger, apiKey *apikey.APIKey) func
 					zlog.Error().Err(err).Msg("failed to mark the previous doc as reenrolled")
 				}
 			}
+			// Freshly enrolled connection: attribute it to the new agent owner.
+			oa.transferConnLease(zlog, conn, tenant.Canonical(agent.Namespaces))
 		} else {
 			if !isActiveStatus(agent.LastCheckinStatus) {
 				sendCapabilities = true

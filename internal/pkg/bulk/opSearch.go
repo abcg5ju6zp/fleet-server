@@ -229,6 +229,8 @@ func (b *Bulker) flushSearch(ctx context.Context, queue queueT) error {
 
 		response := &blk.Responses[i]
 
+		n.releaseOwnerLeases()
+		b.reportOwnerItem(n, response.Status)
 		select {
 		case n.ch <- respT{
 			err:  response.deriveError(),
@@ -363,6 +365,7 @@ func (b *Bulker) flushEnrollSearch(ctx context.Context, queue queueT) error {
 		response := &blk.Responses[i]
 		respErr := response.deriveError()
 		key := n.dedupeKey // must be captured before n.ch send
+		n.releaseOwnerLeases()
 		select {
 		case n.ch <- respT{err: respErr, idx: n.idx, data: response}:
 		default:
@@ -375,6 +378,7 @@ func (b *Bulker) flushEnrollSearch(ctx context.Context, queue queueT) error {
 			dupeErr = respErr
 		}
 		for _, dupe := range dupesByKey[key] {
+			dupe.releaseOwnerLeases()
 			select {
 			case dupe.ch <- respT{err: dupeErr}:
 			default:

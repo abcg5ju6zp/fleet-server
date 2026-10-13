@@ -19,6 +19,7 @@ import (
 
 	"go.elastic.co/apm/v2"
 
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
@@ -26,6 +27,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/logger"
 	"github.com/elastic/fleet-server/v7/internal/pkg/model"
 	"github.com/elastic/fleet-server/v7/internal/pkg/policy"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 	"github.com/elastic/fleet-server/v7/internal/pkg/throttle"
 
 	"github.com/rs/zerolog"
@@ -50,15 +52,20 @@ type ArtifactT struct {
 	cache      cache.Cache
 	esThrottle *throttle.Throttle
 	pm         policy.Monitor
+	budgets    *budget.Registry
 }
 
-func NewArtifactT(cfg *config.Server, bulker bulk.Bulk, cache cache.Cache, pm policy.Monitor) *ArtifactT {
-	return &ArtifactT{
+func NewArtifactT(cfg *config.Server, bulker bulk.Bulk, cache cache.Cache, pm policy.Monitor, opts ...func(*ArtifactT)) *ArtifactT {
+	at := &ArtifactT{
 		bulker:     bulker,
 		cache:      cache,
 		esThrottle: throttle.NewThrottle(defaultMaxParallel),
 		pm:         pm,
 	}
+	for _, opt := range opts {
+		opt(at)
+	}
+	return at
 }
 
 func (at ArtifactT) handleArtifacts(zlog zerolog.Logger, w http.ResponseWriter, r *http.Request, id, sha2 string) error {
@@ -72,6 +79,13 @@ func (at ArtifactT) handleArtifacts(zlog zerolog.Logger, w http.ResponseWriter, 
 
 	zlog = zlog.With().Str(LogAccessAPIKeyID, agent.AccessAPIKeyID).Logger()
 	ctx := zlog.WithContext(r.Context())
+	r = r.WithContext(ctx)
+
+	ctx, lease, admitted := acquireTenantBudget(r, w, at.budgets, budget.ResourceArtifact, tenant.Canonical(agent.Namespaces))
+	if !admitted {
+		return nil
+	}
+	defer lease.Release()
 	r = r.WithContext(ctx)
 
 	if err := at.validateRequest(r.Context(), sha2); err != nil {
@@ -260,7 +274,7 @@ func (at ArtifactT) getArtifact(ctx context.Context, zlog zerolog.Logger, ident,
 	art.Body = dstPayload
 
 	// Update the cache.
-	at.cache.SetArtifact(*art)
+	at.cache.SetArtifact(*art, ctxOwner(ctx))
 
 	return art, nil
 }

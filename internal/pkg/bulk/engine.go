@@ -20,10 +20,12 @@ import (
 	"github.com/elastic/go-ucfg"
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/apikey"
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/build"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
 	"github.com/elastic/fleet-server/v7/internal/pkg/es"
 	"github.com/elastic/fleet-server/v7/internal/pkg/logger/ecs"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 
 	"github.com/rs/zerolog"
 	"go.elastic.co/apm/v2"
@@ -41,7 +43,45 @@ var (
 	ErrNoQuotes              = errors.New("quoted literal not supported")
 	ErrTooManyBulkDispatches = errors.New("too many pending bulk dispatches")
 	ErrEnrollDuplicate       = errors.New("enrollment deduplicated: retry")
+	// ErrTenantDispatchLimit is returned when the owner's bulk_dispatch
+	// (queue position plus in-flight flush reservation) budget rejects.
+	ErrTenantDispatchLimit = errors.New("tenant bulk dispatch budget exhausted")
 )
+
+// tenantDispatchError attributes a bulk dispatch rejection to one owner;
+// it unwraps the budget rejection for Retry-After handling.
+type tenantDispatchError struct {
+	owner tenant.Owner
+	rej   *budget.RejectError
+}
+
+func (e *tenantDispatchError) Error() string {
+	return "tenant bulk dispatch limit reached for " + string(e.owner)
+}
+func (e *tenantDispatchError) Unwrap() error { return e.rej }
+func (e *tenantDispatchError) Is(target error) bool {
+	return target == ErrTenantDispatchLimit
+}
+
+// Owner returns the rejected owner.
+func (e *tenantDispatchError) Owner() tenant.Owner { return e.owner }
+
+// RetryAfter returns the suggested backoff delay, zero for capacity
+// rejections.
+func (e *tenantDispatchError) RetryAfter() time.Duration {
+	if e.rej == nil {
+		return 0
+	}
+	return e.rej.RetryAfter
+}
+
+// Reason returns the machine-readable rejection reason.
+func (e *tenantDispatchError) Reason() budget.Reason {
+	if e.rej == nil {
+		return budget.ReasonMax
+	}
+	return e.rej.Reason
+}
 
 type MultiOp struct {
 	ID    string
@@ -131,6 +171,10 @@ type Bulker struct {
 	remoteOutputConfigMap map[string]map[string]any
 	bulkerMap             map[string]Bulk
 	remoteOutputMutex     sync.RWMutex
+
+	// budgets attributes per-owner dispatch/flush slots; nil keeps the
+	// historical first-come first-served behavior.
+	budgets *budget.Registry
 }
 
 const (
@@ -172,6 +216,7 @@ func NewBulker(es esapi.Transport, tracer *apm.Tracer, opts ...BulkOpt) *Bulker 
 		remoteOutputConfigMap: make(map[string]map[string]any),
 		// remote ES bulkers
 		bulkerMap: make(map[string]Bulk),
+		budgets:   bopts.budgets,
 	}
 	// 0 means no limit; leave readSecretsLimit nil so ReadSecrets skips the semaphore.
 	if bopts.maxConcurrentSecretReads > 0 {
@@ -603,6 +648,10 @@ func (b *Bulker) flushQueue(ctx context.Context, w *semaphore.Weighted, queue qu
 		}
 
 		defer w.Release(1)
+		// Per-block owner leases are released at response fan-out (in the
+		// flush* implementations), synchronously before the response
+		// channel send; releasing here after fan-out would race the
+		// caller recycling the block via freeBlk.
 
 		var err error
 		switch queue.ty {
@@ -619,6 +668,7 @@ func (b *Bulker) flushQueue(ctx context.Context, w *semaphore.Weighted, queue qu
 		}
 
 		if err != nil {
+			b.reportOwnerBatchFailure(queue)
 			failQueue(queue, err)
 			apm.CaptureError(ctx, err).Send()
 		}
@@ -639,7 +689,8 @@ func (b *Bulker) flushQueue(ctx context.Context, w *semaphore.Weighted, queue qu
 
 func failQueue(queue queueT, err error) {
 	for n := queue.head; n != nil; {
-		next := n.next // 'n' is invalid immediately on channel send
+		next := n.next         // 'n' is invalid immediately on channel send
+		n.releaseOwnerLeases() // never rode an ES request
 		select {
 		case n.ch <- respT{
 			err: err,
@@ -669,6 +720,7 @@ func (b *Bulker) newBlk(action actionT, opts optionsT) *bulkT {
 	blk.hasSpanLink = opts.hasSpanLink
 	blk.dedupeKey = opts.DedupeKey
 	blk.refreshIndex = opts.RefreshIndex
+	blk.owner = opts.owner
 
 	return blk
 }
@@ -712,6 +764,45 @@ func (b *Bulker) validateBody(body []byte) error {
 
 func (b *Bulker) dispatch(ctx context.Context, blk *bulkT) respT {
 	start := time.Now()
+
+	// Snapshot ownership at admission time from the caller context unless
+	// the transaction pinned one explicitly. It must not be re-derived
+	// later: by flush time the request context may be canceled and the
+	// originating agent document may have changed.
+	if blk.owner == "" {
+		if owner, ok := tenant.OwnerFromContext(ctx); ok {
+			blk.owner = owner
+		} else {
+			blk.owner = tenant.Default
+		}
+	}
+
+	// Per-owner admission: claims a queue position and a guaranteed share
+	// of an in-flight flush slot for the block's whole life. This is the
+	// fair kernel: a saturated owner fails fast here instead of filling
+	// the shared entry channel, and its blocks can never reserve all
+	// flush workers. The existing global counter stays as a backstop.
+	if b.budgets != nil {
+		dl, derr := b.budgets.TryAcquire(budget.ResourceBulkDispatch, blk.owner)
+		if derr != nil {
+			rej := asReject(derr)
+			b.rejectOwnerDispatch(blk, rej)
+			terr := &tenantDispatchError{owner: blk.owner, rej: rej}
+			b.freeBlk(blk)
+			return respT{err: terr}
+		}
+		fl, ferr := b.budgets.TryAcquire(budget.ResourceBulkFlush, blk.owner)
+		if ferr != nil {
+			rej := asReject(ferr)
+			dl.Release()
+			b.rejectOwnerDispatch(blk, rej)
+			terr := &tenantDispatchError{owner: blk.owner, rej: rej}
+			b.freeBlk(blk)
+			return respT{err: terr}
+		}
+		blk.dispatchLease = dl
+		blk.flushLease = fl
+	}
 
 	// Check pending bulk dispatch limit before blocking on the channel.
 	if limit := b.opts.maxPendingBulkDispatches; limit > 0 {
@@ -764,8 +855,11 @@ func (b *Bulker) dispatch(ctx context.Context, blk *bulkT) respT {
 			Bool("refresh", blk.flags.Has(flagRefresh)).
 			Dur("rtt", time.Since(start)).
 			Msg("Dispatch abort response")
-		// blk is in the Run loop's queue; drain the response and free
-		// asynchronously so the caller can return immediately.
+		// The request is gone: close namespace budget accounting
+		// immediately (queue position and flush reservation return to
+		// the owner even if ES is slow). The block itself drains the
+		// late response and returns to the pool asynchronously.
+		blk.releaseOwnerLeases()
 		go b.drainAndFreeAbortedBlk(blk)
 	}
 
@@ -781,5 +875,64 @@ func (b *Bulker) drainAndFreeAbortedBlk(blk *bulkT) {
 	case <-blk.ch:
 		b.freeBlk(blk)
 	case <-time.After(dispatchAbortDrainTimeout):
+	}
+}
+
+// rejectOwnerDispatch records the owner-scoped rejection reason for
+// metrics visibility (per-owner rejected counters are maintained inside
+// the budget registry itself).
+func (b *Bulker) rejectOwnerDispatch(blk *bulkT, rej *budget.RejectError) {
+	if b.budgets == nil || blk == nil || rej == nil {
+		return
+	}
+	zerolog.Ctx(context.Background()).Trace().
+		Str("mod", kModBulk).
+		Str("owner", string(blk.owner)).
+		Str("reason", string(rej.Reason)).
+		Dur("retry_after", rej.RetryAfter).
+		Msg("bulk dispatch rejected for namespace owner")
+}
+
+// asReject normalizes a TryAcquire error for embedding; TryAcquire only
+// ever returns *budget.RejectError, but the defensive default keeps a
+// machine-readable reason on unexpected paths.
+func asReject(err error) *budget.RejectError {
+	if rej, ok := budget.As(err); ok {
+		return rej
+	}
+	return &budget.RejectError{Reason: budget.ReasonMax}
+}
+
+// reportOwnerItem feeds per-item outcomes into the owner's bulk backoff
+// state machine. Only 429/5xx arm cooldown; 2xx clears it.
+func (b *Bulker) reportOwnerItem(blk *bulkT, status int) {
+	if b.budgets == nil || blk == nil || blk.owner == "" {
+		return
+	}
+	switch {
+	case status >= 200 && status < 300:
+		b.budgets.ReportSuccess(budget.ResourceBulkDispatch, blk.owner)
+	case status == 429 || status >= 500:
+		b.budgets.ReportFailure(budget.ResourceBulkDispatch, blk.owner)
+	}
+}
+
+// reportOwnerBatchFailure records a whole-batch transport failure against
+// every owner with a block in the flushed queue, so a poisoned ES
+// connection only backs off the owners that actually rode it.
+func (b *Bulker) reportOwnerBatchFailure(queue queueT) {
+	if b.budgets == nil {
+		return
+	}
+	seen := map[tenant.Owner]struct{}{}
+	for n := queue.head; n != nil; n = n.next {
+		if n.owner == "" {
+			continue
+		}
+		if _, ok := seen[n.owner]; ok {
+			continue
+		}
+		seen[n.owner] = struct{}{}
+		b.budgets.ReportFailure(budget.ResourceBulkDispatch, n.owner)
 	}
 }

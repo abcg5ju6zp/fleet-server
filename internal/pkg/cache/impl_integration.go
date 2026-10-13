@@ -12,7 +12,11 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
 )
 
-func newCache(_ config.Cache) (Cacher, error) {
+// fairEvictionAccounting reports whether the underlying cache emits
+// exit callbacks. NoCache keeps nothing, so no cost can be tracked.
+const fairEvictionAccounting = false
+
+func newCache(_ config.Cache, _ onExit) (Cacher, error) {
 	return &NoCache{}, nil
 }
 
@@ -28,6 +32,9 @@ func (c *NoCache) Set(_ string, _ any, _ int64) bool {
 
 func (c *NoCache) SetWithTTL(_ string, _ any, _ int64, _ time.Duration) bool {
 	return true
+}
+
+func (c *NoCache) Del(_ string) {
 }
 
 func (c *NoCache) Close() {

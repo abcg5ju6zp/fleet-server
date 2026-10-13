@@ -17,6 +17,12 @@ var (
 	ErrMaxLimit  = errors.New("max limit")
 )
 
+// WriteError writes the legacy 429 JSON body for a rate/max-limit error,
+// preserving the exact response shape emitted by the route limiter.
+func WriteError(log *zerolog.Logger, w http.ResponseWriter, err error) error {
+	return writeError(log, w, err)
+}
+
 // writeError recreates the behaviour of api/error.go.
 // It is defined separately here to stop a circular import
 func writeError(log *zerolog.Logger, w http.ResponseWriter, err error) error {

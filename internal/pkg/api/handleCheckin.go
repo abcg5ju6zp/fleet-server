@@ -25,6 +25,7 @@ import (
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/action"
 	"github.com/elastic/fleet-server/v7/internal/pkg/apikey"
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/checkin"
@@ -37,6 +38,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/policy"
 	"github.com/elastic/fleet-server/v7/internal/pkg/secret"
 	"github.com/elastic/fleet-server/v7/internal/pkg/sqn"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/hashicorp/go-version"
@@ -108,6 +110,9 @@ type CheckinT struct {
 	gwPool                         sync.Pool
 	bulker                         bulk.Bulk
 	outputSecretCandidateCollector policy.OutputSecretCandidateCollector
+
+	// budgets attributes namespace concurrency for check-in long polls.
+	budgets *budget.Registry
 
 	// invalidKeyStates is a memory-bounded LRU that tracks per-agent invalid-API-key escalation
 	// state for the GracefulForceUnenroll feature. Its cap is set by
@@ -193,6 +198,17 @@ func (ct *CheckinT) handleCheckin(zlog zerolog.Logger, w http.ResponseWriter, r 
 	if err != nil {
 		return err
 	}
+
+	// Second admission stage: namespace fair-share budget for the whole
+	// long poll; the lease is held through subscribe/select and released
+	// on every exit path (including shutdown responses).
+	owner := tenant.Canonical(agent.Namespaces)
+	ctx, lease, admitted := acquireTenantBudget(r, w, ct.budgets, budget.ResourceCheckin, owner)
+	if !admitted {
+		return nil
+	}
+	defer lease.Release()
+	r = r.WithContext(ctx)
 
 	// Safely check if the agent version is different, return empty string otherwise
 	newVer := agent.CheckDifferentVersion(ver)
@@ -464,6 +480,7 @@ func (ct *CheckinT) validateRequest(zlog zerolog.Logger, w http.ResponseWriter, 
 }
 
 func (ct *CheckinT) ProcessRequest(zlog zerolog.Logger, w http.ResponseWriter, r *http.Request, start time.Time, agent *model.Agent, ver string) error {
+	subOwner := tenant.Canonical(agent.Namespaces)
 	zlog = zlog.With().
 		Str(ecs.AgentID, agent.Id).Logger()
 	validated, err := ct.validateRequest(zlog, w, r, start, agent)
@@ -492,6 +509,7 @@ func (ct *CheckinT) ProcessRequest(zlog zerolog.Logger, w http.ResponseWriter, r
 		checkin.WithVer(ver),
 		checkin.WithUnhealthyReason(unhealthyReason),
 		checkin.WithDeleteAudit(agent.AuditUnenrolledReason != "" || agent.UnenrolledAt != ""),
+		checkin.WithOwner(requestOwner(r)),
 	}
 
 	if validated.rawAvailableRollbacks != nil {
@@ -507,7 +525,7 @@ func (ct *CheckinT) ProcessRequest(zlog zerolog.Logger, w http.ResponseWriter, r
 	}
 
 	// Subscribe to actions dispatcher
-	aSub := ct.ad.Subscribe(zlog, agent.Id, seqno)
+	aSub := ct.ad.Subscribe(zlog, agent.Id, seqno, subOwner)
 	defer ct.ad.Unsubscribe(zlog, aSub)
 	actCh := aSub.Ch()
 
@@ -539,7 +557,7 @@ func (ct *CheckinT) ProcessRequest(zlog zerolog.Logger, w http.ResponseWriter, r
 	}
 
 	// Subscribe to policy manager for changes on PolicyId > policyRev
-	sub, err := ct.pm.Subscribe(agent.Id, agent.PolicyID, revID)
+	sub, err := ct.pm.Subscribe(agent.Id, agent.PolicyID, revID, subOwner)
 	if err != nil {
 		return fmt.Errorf("subscribe policy monitor: %w", err)
 	}
@@ -629,7 +647,7 @@ func (ct *CheckinT) ProcessRequest(zlog zerolog.Logger, w http.ResponseWriter, r
 				zlog.Trace().Msg("fire long poll")
 				break LOOP
 			case <-tick.C:
-				err := ct.bc.CheckIn(agent.Id, checkin.WithStatus(string(req.Status)), checkin.WithMessage(req.Message), checkin.WithComponents(rawComponents), checkin.WithVer(ver), checkin.WithUnhealthyReason(unhealthyReason)) // FIXME If we change to properly handle empty strings we could stop passing optional args here.
+				err := ct.bc.CheckIn(agent.Id, checkin.WithStatus(string(req.Status)), checkin.WithMessage(req.Message), checkin.WithComponents(rawComponents), checkin.WithVer(ver), checkin.WithUnhealthyReason(unhealthyReason), checkin.WithOwner(requestOwner(r))) // FIXME If we change to properly handle empty strings we could stop passing optional args here.
 				if err != nil {
 					zlog.Error().Err(err).Str(ecs.AgentID, agent.Id).Msg("checkin failed")
 				}
@@ -670,7 +688,7 @@ func (ct *CheckinT) verifyActionExists(vCtx context.Context, vSpan *apm.Span, ag
 			return nil, nil
 		}
 		action = actions[0]
-		ct.cache.SetAction(action)
+		ct.cache.SetAction(action, ctxOwner(vCtx))
 	}
 	vSpan.End()
 	return &action, nil

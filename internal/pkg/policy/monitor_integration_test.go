@@ -75,7 +75,7 @@ func TestMonitor_Integration(t *testing.T) {
 
 	agentID := uuid.Must(uuid.NewV4()).String()
 	policyID := uuid.Must(uuid.NewV4()).String()
-	s, err := m.Subscribe(agentID, policyID, 0)
+	s, err := m.Subscribe(agentID, policyID, 0, "space-a")
 	defer m.Unsubscribe(s) //nolint:errcheck // defered function
 	if err != nil {
 		t.Fatal(err)
@@ -167,7 +167,7 @@ func TestMonitor_Debounce_Integration(t *testing.T) {
 
 	agentID := uuid.Must(uuid.NewV4()).String()
 	policyID := uuid.Must(uuid.NewV4()).String()
-	s, err := m.Subscribe(agentID, policyID, 0)
+	s, err := m.Subscribe(agentID, policyID, 0, "space-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,7 @@ func TestMonitor_Debounce_Integration(t *testing.T) {
 	}
 
 	// Make new subscription to replicate agent checking in again.
-	s2, err := m.Subscribe(agentID, policyID, 1)
+	s2, err := m.Subscribe(agentID, policyID, 1, "space-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestMonitor_Debounce_Integration(t *testing.T) {
 
 	}
 
-	s3, err := m.Subscribe(agentID, policyID, 3)
+	s3, err := m.Subscribe(agentID, policyID, 3, "space-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,14 +371,14 @@ func TestMonitor_Revisions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err := m.Subscribe(agentID, policyID, 1)
+	s, err := m.Subscribe(agentID, policyID, 1, "space-a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Unsubscribe(s) //nolint:errcheck // defered function
 
 	agent2 := uuid.Must(uuid.NewV4()).String()
-	s2, err := m.Subscribe(agent2, policyID, 1)
+	s2, err := m.Subscribe(agent2, policyID, 1, "space-b")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,14 +489,14 @@ func TestMonitor_KickDeploy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err := m.Subscribe(agentID, policyID, 1)
+	s, err := m.Subscribe(agentID, policyID, 1, "space-a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Unsubscribe(s) //nolint:errcheck // defered function
 
 	// Force a new policy load so that the kickLoad() func runs
-	s2, err := m.Subscribe("test", "test", 1)
+	s2, err := m.Subscribe("test", "test", 1, "space-a")
 	if err != nil {
 		t.Fatal(err)
 	}

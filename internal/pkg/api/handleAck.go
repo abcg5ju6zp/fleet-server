@@ -20,6 +20,7 @@ import (
 	"go.elastic.co/apm/module/apmhttp/v2"
 	"go.elastic.co/apm/v2"
 
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
@@ -30,6 +31,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/policy"
 	"github.com/elastic/fleet-server/v7/internal/pkg/secret"
 	"github.com/elastic/fleet-server/v7/internal/pkg/smap"
+	"github.com/elastic/fleet-server/v7/internal/pkg/tenant"
 )
 
 const (
@@ -74,7 +76,7 @@ func (a *AckResponse) SetError(pos int, err error) {
 	var esErr *es.ErrElastic
 	if errors.As(err, &esErr) {
 		a.setMessage(pos, esErr.Status, esErr.Reason)
-	} else if errors.Is(err, bulk.ErrTooManyBulkDispatches) {
+	} else if errors.Is(err, bulk.ErrTooManyBulkDispatches) || errors.Is(err, bulk.ErrTenantDispatchLimit) {
 		a.SetResult(pos, http.StatusTooManyRequests)
 	} else {
 		a.SetResult(pos, http.StatusInternalServerError)
@@ -82,17 +84,22 @@ func (a *AckResponse) SetError(pos int, err error) {
 }
 
 type AckT struct {
-	cfg   *config.Server
-	bulk  bulk.Bulk
-	cache cache.Cache
+	cfg     *config.Server
+	bulk    bulk.Bulk
+	cache   cache.Cache
+	budgets *budget.Registry
 }
 
-func NewAckT(cfg *config.Server, bulker bulk.Bulk, cache cache.Cache) *AckT {
-	return &AckT{
+func NewAckT(cfg *config.Server, bulker bulk.Bulk, cache cache.Cache, opts ...func(*AckT)) *AckT {
+	ack := &AckT{
 		cfg:   cfg,
 		bulk:  bulker,
 		cache: cache,
 	}
+	for _, opt := range opts {
+		opt(ack)
+	}
+	return ack
 }
 
 func (ack *AckT) handleAcks(zlog zerolog.Logger, w http.ResponseWriter, r *http.Request, id string) error {
@@ -102,6 +109,13 @@ func (ack *AckT) handleAcks(zlog zerolog.Logger, w http.ResponseWriter, r *http.
 	}
 	zlog = zlog.With().Str(LogAccessAPIKeyID, agent.AccessAPIKeyID).Logger()
 	ctx := zlog.WithContext(r.Context())
+	r = r.WithContext(ctx)
+
+	ctx, lease, admitted := acquireTenantBudget(r, w, ack.budgets, budget.ResourceAck, tenant.Canonical(agent.Namespaces))
+	if !admitted {
+		return nil
+	}
+	defer lease.Release()
 	r = r.WithContext(ctx)
 
 	return ack.processRequest(zlog, w, r, agent)
@@ -301,7 +315,7 @@ func (ack *AckT) handleAckEvents(ctx context.Context, zlog zerolog.Logger, agent
 				continue
 			}
 			action = actions[0]
-			ack.cache.SetAction(action)
+			ack.cache.SetAction(action, ctxOwner(ctx))
 		}
 		vSpan.End()
 

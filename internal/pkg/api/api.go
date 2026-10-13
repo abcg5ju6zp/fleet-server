@@ -9,6 +9,7 @@ import (
 
 	"go.elastic.co/apm/v2"
 
+	"github.com/elastic/fleet-server/v7/internal/pkg/budget"
 	"github.com/elastic/fleet-server/v7/internal/pkg/rollback"
 
 	"github.com/rs/zerolog/hlog"
@@ -95,6 +96,10 @@ type apiServer struct {
 	ft    *FileDeliveryT
 	pt    *PGPRetrieverT
 	audit *AuditT
+
+	// budgets is the process-wide namespace budget registry shared by both
+	// listeners; nil leaves every handler on legacy global-only limits.
+	budgets *budget.Registry
 
 	// tracer is used by the wrapping server to instrument the API server
 	tracer *apm.Tracer
