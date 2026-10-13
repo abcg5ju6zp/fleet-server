@@ -26,11 +26,11 @@ type ChunkEncoder struct {
 	wroteTerm   bool
 }
 
-func NewChunkWriter(chunkData io.Reader, finalChunk bool, baseID string, chunkHash string, chunkSize int64) *ChunkEncoder {
+func NewChunkWriter(chunkData io.Reader, finalChunk bool, baseID string, uploadID string, chunkHash string, chunkSize int64) *ChunkEncoder {
 	return &ChunkEncoder{
 		chunk:       chunkData,
 		final:       finalChunk,
-		preamble:    encodePreambleToCBOR(finalChunk, baseID, chunkHash, chunkSize),
+		preamble:    encodePreambleToCBOR(finalChunk, baseID, uploadID, chunkHash, chunkSize),
 		prbWritten:  false,
 		prbWritePos: 0,
 		wroteTerm:   false,
@@ -43,6 +43,7 @@ func NewChunkWriter(chunkData io.Reader, finalChunk bool, baseID string, chunkHa
 //		"@timestamp": 1687891588,
 //		"last": true/false,
 //		"bid": "baseID",
+//		"upload_id": "sessionGeneration",
 //		"sha2": "...",
 //		"data":
 //	}
@@ -52,8 +53,9 @@ func NewChunkWriter(chunkData io.Reader, finalChunk bool, baseID string, chunkHa
 // expecting the next section to be filled in by the caller.
 // the CBOR spec may be found here: https://www.rfc-editor.org/rfc/rfc8949
 // chunksize is ignored when writing the "final"=true chunk
-func encodePreambleToCBOR(final bool, baseID string, chunkHash string, chunkSize int64) []byte {
+func encodePreambleToCBOR(final bool, baseID string, uploadID string, chunkHash string, chunkSize int64) []byte {
 	bidLen := len(baseID)
+	uidLen := len(uploadID)
 	hashLen := len(chunkHash)
 
 	// if we know the size of the chunk stream, we will write the 4-byte uint32
@@ -65,8 +67,10 @@ func encodePreambleToCBOR(final bool, baseID string, chunkHash string, chunkSize
 		chunkLen = 1
 	}
 
-	preamble := make([]byte, 31+bidLen+2+5+hashLen+2+chunkLen+5)
-	preamble[0] = 0xA5 // Object with 5 keys
+	// fixed header (31 bytes) + "bid" key/value + "upload_id" key (10) and value +
+	// "sha2" key/value + "data" key (5) + the data length descriptor
+	preamble := make([]byte, 31+bidLen+2+10+uidLen+2+5+hashLen+2+5+chunkLen)
+	preamble[0] = 0xA6 // Object with 6 keys
 	preamble[1] = 0x6a // string with 10 characters (@timestamp)
 	preamble[2] = '@'
 	preamble[3] = 't'
@@ -97,6 +101,16 @@ func encodePreambleToCBOR(final bool, baseID string, chunkHash string, chunkSize
 	preamble[30] = 'd'
 	i := 31
 	if n, err := writeString(preamble[i:], baseID); err != nil {
+		return nil
+	} else {
+		i += n
+	}
+	if n, err := writeKey(preamble[i:], "upload_id"); err != nil {
+		return nil
+	} else {
+		i += n
+	}
+	if n, err := writeString(preamble[i:], uploadID); err != nil {
 		return nil
 	} else {
 		i += n

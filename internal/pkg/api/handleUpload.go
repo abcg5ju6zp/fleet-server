@@ -14,7 +14,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/rs/zerolog"
 	"go.elastic.co/apm/v2"
@@ -24,14 +23,13 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
 	"github.com/elastic/fleet-server/v7/internal/pkg/config"
 	"github.com/elastic/fleet-server/v7/internal/pkg/file"
-	"github.com/elastic/fleet-server/v7/internal/pkg/file/cbor"
 	"github.com/elastic/fleet-server/v7/internal/pkg/file/uploader"
 	"github.com/elastic/fleet-server/v7/internal/pkg/model"
 	"github.com/elastic/go-elasticsearch/v8"
 )
 
 const (
-	maxUploadTimer = 24 * time.Hour
+	maxUploadTimer = uploader.DefaultUploadLifetime
 )
 
 var (
@@ -132,7 +130,7 @@ func (ut *UploadT) handleUploadBegin(_ zerolog.Logger, w http.ResponseWriter, r 
 	return nil
 }
 
-func (ut *UploadT) handleUploadChunk(zlog zerolog.Logger, w http.ResponseWriter, r *http.Request, uplID string, chunkID int, chunkHash string) error {
+func (ut *UploadT) handleUploadChunk(_ zerolog.Logger, w http.ResponseWriter, r *http.Request, uplID string, chunkID int, chunkHash string) error {
 	// chunkHash is checked by router
 	upinfo, chunkInfo, err := ut.uploader.Chunk(r.Context(), uplID, chunkID, chunkHash)
 	if err != nil {
@@ -144,38 +142,34 @@ func (ut *UploadT) handleUploadChunk(zlog zerolog.Logger, w http.ResponseWriter,
 		return fmt.Errorf("error authenticating for chunk upload: %w", err)
 	}
 
-	// prevent over-sized chunks
-	data := http.MaxBytesReader(w, r.Body, file.MaxChunkSize)
+	// bound the chunk size to prevent memory exhaustion; chunks are buffered
+	// (at most MaxChunkSize per request) so the content hash can be verified
+	// before anything is written and conflicting retries can be isolated
+	limited := http.MaxBytesReader(w, r.Body, file.MaxChunkSize)
+	data, readErr := io.ReadAll(limited)
+	if readErr != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(readErr, &maxBytesErr) {
+			return uploader.ErrPayloadSizeTooLarge
+		}
+		return &BadRequestErr{msg: "unable to read upload chunk", nextErr: readErr}
+	}
 
-	// compute hash as we stream it
-	hash := sha256.New()
-	copier := io.TeeReader(data, hash)
+	// verify the streaming content hash before indexing so an invalid chunk
+	// never reaches Elasticsearch
+	hashsumBytes := sha256.Sum256(data)
+	hashsum := hex.EncodeToString(hashsumBytes[:])
+	if !strings.EqualFold(chunkHash, hashsum) {
+		return uploader.ErrHashMismatch
+	}
 
-	ce := cbor.NewChunkWriter(copier, chunkInfo.Last, chunkInfo.BID, chunkInfo.SHA2, upinfo.ChunkSize)
-	if err := uploader.IndexChunk(r.Context(), ut.chunkClient, ce, upinfo.Source, chunkInfo.BID, chunkInfo.Pos); err != nil {
+	// write the chunk idempotently (position + content hash); an identical
+	// retry succeeds and a different-content collision is isolated, not
+	// overwritten
+	if err := ut.uploader.WriteChunk(r.Context(), upinfo, chunkInfo, data); err != nil {
 		return err
 	}
 
-	span, ctx := apm.StartSpan(r.Context(), "validateIndexChunk", "validate")
-	hashsum := hex.EncodeToString(hash.Sum(nil))
-
-	if !strings.EqualFold(chunkHash, hashsum) {
-		// delete document, since we wrote it, but the hash was invalid
-		// context scoped to allow this operation to finish even if client disconnects
-		if err := uploader.DeleteChunk(ctx, ut.bulker, upinfo.Source, chunkInfo.BID, chunkInfo.Pos); err != nil {
-			zlog.Warn().Err(err).
-				Str("source", upinfo.Source).
-				Str("fileID", chunkInfo.BID).
-				Int("chunkNum", chunkInfo.Pos).
-				Msg("a chunk hash mismatch occurred, and fleet server was unable to remove the invalid chunk")
-		}
-		span.End()
-		return uploader.ErrHashMismatch
-	}
-	span.End()
-
-	span, _ = apm.StartSpan(r.Context(), "response", "write")
-	defer span.End()
 	w.WriteHeader(http.StatusOK)
 	return nil
 }

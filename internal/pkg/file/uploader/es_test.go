@@ -16,9 +16,9 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestIndexChunkDoesNotUseExpensiveParams(t *testing.T) {
+func TestCreateChunkDoesNotUseExpensiveParams(t *testing.T) {
 	c, mockTX := esutil.MockESClient(t)
-	chunker := cbor.NewChunkWriter(bytes.NewReader([]byte{}), false, "", "", 100)
+	chunker := cbor.NewChunkWriter(bytes.NewReader([]byte{}), false, "bid", "generation", "", 100)
 	called := false
 	mockTX.RoundTripFn = func(req *http.Request) (*http.Response, error) {
 		if strings.Contains(req.URL.Path, "/_create") {
@@ -35,7 +35,7 @@ func TestIndexChunkDoesNotUseExpensiveParams(t *testing.T) {
 		}, nil
 	}
 
-	err := IndexChunk(t.Context(), c, chunker, "mypkg", "sampleFileID", 0)
+	_, err := createChunkDoc(t.Context(), c, chunker, "mypkg", "sampleFileID.0")
 	assert.NoError(t, err)
 
 	assert.True(t, called, "_create API was not called")

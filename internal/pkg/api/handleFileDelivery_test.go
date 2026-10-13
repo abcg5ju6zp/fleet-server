@@ -661,6 +661,106 @@ func TestFileLibraryDelivery(t *testing.T) {
 	assert.Equal(t, "deadbeef", rec.Header().Get("X-File-SHA2"))
 }
 
+// A published zero-byte file is served as an empty 200 response without any
+// chunk lookup.
+func TestFileDeliveryZeroByte(t *testing.T) {
+	hr, _, _, bulk := prepareFileDeliveryMock(t)
+	rec := httptest.NewRecorder()
+
+	bulk.On("Search", mock.Anything, isFileMetaSearch, mock.Anything, mock.Anything, mock.Anything).Return(
+		&es.ResultT{
+			HitsT: es.HitsT{
+				Hits: []es.HitT{{
+					ID:    "X",
+					Index: fmt.Sprintf(delivery.FileHeaderIndexPattern, "endpoint"),
+					Source: []byte(`{
+						"file": {
+							"Status": "READY",
+							"mime_type": "text/plain",
+							"ChunkSize": 4194304,
+							"size": 0
+						}
+					}`),
+				}},
+			},
+		}, nil,
+	)
+
+	hr.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/fleet/file/X", nil))
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, 0, rec.Body.Len())
+	assert.Equal(t, "0", rec.Header().Get("Content-Length"))
+	bulk.AssertNotCalled(t, "Search", mock.Anything, isFileChunkSearch, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// Range requests against a zero-byte file are not satisfiable.
+func TestFileDeliveryZeroByteRange(t *testing.T) {
+	hr, _, _, bulk := prepareFileDeliveryMock(t)
+	rec := httptest.NewRecorder()
+
+	bulk.On("Search", mock.Anything, isFileMetaSearch, mock.Anything, mock.Anything, mock.Anything).Return(
+		&es.ResultT{
+			HitsT: es.HitsT{
+				Hits: []es.HitT{{
+					ID:    "X",
+					Index: fmt.Sprintf(delivery.FileHeaderIndexPattern, "endpoint"),
+					Source: []byte(`{
+						"file": {"Status": "READY", "ChunkSize": 4194304, "size": 0}
+					}`),
+				}},
+			},
+		}, nil,
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/fleet/file/X", nil)
+	req.Header.Set("Range", "bytes=0-")
+	hr.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusRequestedRangeNotSatisfiable, rec.Code)
+}
+
+// Published metadata that is not backed by a complete chunk set must not be
+// served (gap protection for whole-file and Range reads).
+func TestFileDeliveryIncompleteChunks(t *testing.T) {
+	hr, _, _, bulk := prepareFileDeliveryMock(t)
+	rec := httptest.NewRecorder()
+
+	bulk.On("Search", mock.Anything, isFileMetaSearch, mock.Anything, mock.Anything, mock.Anything).Return(
+		&es.ResultT{
+			HitsT: es.HitsT{
+				Hits: []es.HitT{{
+					ID:    "X",
+					Index: fmt.Sprintf(delivery.FileHeaderIndexPattern, "endpoint"),
+					Source: []byte(`{
+						"file": {
+							"Status": "READY",
+							"mime_type": "application/octet-stream",
+							"ChunkSize": 4,
+							"size": 8
+						}
+					}`),
+				}},
+			},
+		}, nil,
+	)
+	// only chunk 0 of the 2 implied chunks is present
+	bulk.On("Search", mock.Anything, isFileChunkSearch, mock.Anything, mock.Anything, mock.Anything).Return(
+		&es.ResultT{
+			HitsT: es.HitsT{
+				Hits: []es.HitT{{
+					ID:     "X.0",
+					Index:  fmt.Sprintf(delivery.FileDataIndexPattern, "endpoint"),
+					Fields: map[string]any{file.FieldBaseID: []any{"X"}, file.FieldLast: []any{false}},
+				}},
+			},
+		}, nil,
+	)
+
+	hr.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/fleet/file/X", nil))
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
 /*
 	Helpers and mocks
 */

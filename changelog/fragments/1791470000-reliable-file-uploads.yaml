@@ -1,0 +1,23 @@
+kind: enhancement
+
+summary: Make agent file uploads reliable across retries, restarts and concurrent Fleet Servers
+
+description: |
+  File (diagnostics/action) uploads from agents are now resilient to lost
+  responses, retries, Fleet Server restarts and multi-instance operation.
+  Upload begin pins the agent, action, namespaces, source index, file size and
+  session generation and returns a reusable session for the deterministic
+  action/agent document ID; expired or failed sessions start a fresh
+  generation. Chunk writes are idempotent by position and content hash, and a
+  chunk with conflicting content is isolated instead of overwriting an already
+  confirmed chunk. Completion verifies all chunks, order, size and the transit
+  digest, then atomically publishes READY metadata; whole-file and Range
+  downloads remain gated on that publication, and an uncertain publish response
+  is resolved by re-reading the existing session rather than rebuilding a
+  second file. Garbage collection reclaims expired sessions by generation,
+  preserves published files and cannot delete a newer upload that reuses an
+  identifier. Zero-byte files, uploads with the feature disabled, requests
+  without Range, legal single Range requests and existing library-file
+  authorization continue to behave as before.
+
+component: fleet-server

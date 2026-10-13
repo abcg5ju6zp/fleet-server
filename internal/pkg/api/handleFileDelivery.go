@@ -64,11 +64,12 @@ func (ft *FileDeliveryT) handleSendFile(zlog zerolog.Logger, w http.ResponseWrit
 		return err
 	}
 
-	// determine storage place for file lookup Can be either in integration libraries ( ?source=X ) OR agent-targeted, fleet-owned stream
+	var libraryFile bool
 	var info file.MetaDoc
 	var idx string
 	libStorageSrc := sanitizedIndexInput(r.URL.Query().Get("source"))
 	if libStorageSrc != "" {
+		libraryFile = true
 		// determine integration client for library file
 		clientSrc := sanitizedIndexInput(r.Header.Get(HTTPProductOriginHeader))
 		if clientSrc == "" {
@@ -90,6 +91,21 @@ func (ft *FileDeliveryT) handleSendFile(zlog zerolog.Logger, w http.ResponseWrit
 		}
 	}
 
+	// A zero-byte, published file is served as an empty 200 response: there
+	// are no chunk documents to locate, and Range requests cannot apply.
+	if info.File.Size == 0 {
+		ranges, err := parseRange(r.Header.Get("Range"), info.File.Size)
+		if err != nil {
+			w.Header().Set("Content-Range", "bytes */0")
+			return fmt.Errorf("%w: %w", ErrBadRange, err)
+		}
+		if len(ranges) > 0 {
+			w.Header().Set("Content-Range", "bytes */0")
+			return ErrBadRange
+		}
+		return ft.sendFullFile(zlog, w, r, fileID, info, nil)
+	}
+
 	chunks, err := ft.deliverer.LocateChunks(r.Context(), zlog, fileID, idx)
 	if errors.Is(err, delivery.ErrNoFile) {
 		w.WriteHeader(http.StatusNotFound)
@@ -98,6 +114,18 @@ func (ft *FileDeliveryT) handleSendFile(zlog zerolog.Logger, w http.ResponseWrit
 	if err != nil {
 		return err
 	}
+
+	// Agent-targeted files may only be read once the published metadata is
+	// backed by a complete, gap-free chunk set in the positions implied by
+	// the pinned file size. This guards against serving partially confirmed
+	// data whole or via Range. Library files are written by integrations and
+	// keep their pre-existing authorization and lookup behavior.
+	if !libraryFile && !chunksFormCompleteFile(info, chunks) {
+		zlog.Warn().Str("fileID", fileID).Int64("size", info.File.Size).Msg("published file metadata is not backed by a complete chunk set")
+		w.WriteHeader(http.StatusNotFound)
+		return delivery.ErrNoFile
+	}
+
 	w.Header().Set("Accept-Ranges", "bytes")
 
 	// Send partial content if Range is requested
@@ -127,9 +155,8 @@ func (ft *FileDeliveryT) sendFullFile(zlog zerolog.Logger, w http.ResponseWriter
 		w.Header().Set("Content-Type", info.File.MimeType)
 	}
 
-	if info.File.Size > 0 {
-		w.Header().Set("Content-Length", strconv.FormatInt(info.File.Size, 10))
-	}
+	// always advertise the exact length, including zero-byte files
+	w.Header().Set("Content-Length", strconv.FormatInt(info.File.Size, 10))
 
 	if info.File.Hash != nil && info.File.Hash.SHA2 != "" {
 		w.Header().Set("X-File-SHA2", info.File.Hash.SHA2)
@@ -142,6 +169,34 @@ func (ft *FileDeliveryT) sendFullFile(zlog zerolog.Logger, w http.ResponseWriter
 func sanitizedIndexInput(s string) string {
 	r := regexp.MustCompile(`[*?"<>\\/,|#]`) // bad characters
 	return r.ReplaceAllString(strings.ToLower(strings.TrimSpace(s)), "")
+}
+
+// chunksFormCompleteFile verifies the located chunk set is complete relative
+// to the published metadata: contiguous positions starting at zero with no
+// duplicates or gaps, and (when the metadata records a chunk size, as all
+// agent-uploaded files do) the chunk count matches the pinned file size.
+// Files may only be streamed whole or via Range when this holds.
+func chunksFormCompleteFile(info file.MetaDoc, chunks []file.ChunkInfo) bool {
+	if len(chunks) == 0 {
+		return false
+	}
+	positions := make([]int, len(chunks))
+	for i, c := range chunks {
+		positions[i] = c.Pos
+	}
+	sort.Ints(positions)
+	for i, p := range positions {
+		if p != i {
+			return false
+		}
+	}
+	// Legacy/integration-written metadata may omit ChunkSize; contiguity alone
+	// is enforced in that case.
+	if info.File.ChunkSize <= 0 {
+		return true
+	}
+	expected := int((info.File.Size + info.File.ChunkSize - 1) / info.File.ChunkSize)
+	return expected == len(chunks)
 }
 
 func (ft *FileDeliveryT) sendFileAsRanges(zlog zerolog.Logger, w http.ResponseWriter, r *http.Request, fileID string, info file.MetaDoc, chunks []file.ChunkInfo, ranges []httpRange) error {

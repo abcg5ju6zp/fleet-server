@@ -83,11 +83,16 @@ func TestUploadCompletePerformsRefreshBeforeChunkSearch(t *testing.T) {
 		if strings.Contains(req.URL.Path, fmt.Sprintf(UploadDataIndexPattern, fakeIntegrationSrc)+"/_refresh") {
 			refreshCalled = true
 		}
+		body := `{}`
+		if strings.Contains(req.URL.Path, "/_update/") {
+			// metadata status transitions report "updated"
+			body = `{"result":"updated"}`
+		}
 		respHeaders := make(http.Header)
 		respHeaders.Set("X-Elastic-Product", "Elasticsearch")
 		return &http.Response{
 			StatusCode: 200,
-			Body:       io.NopCloser(strings.NewReader(`{}`)),
+			Body:       io.NopCloser(strings.NewReader(body)),
 			Header:     respHeaders,
 		}, nil
 	}

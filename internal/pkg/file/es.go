@@ -26,18 +26,29 @@ const (
 )
 
 var (
-	QueryChunkInfoWithSize = prepareChunkInfo(true)
-	QueryChunkInfo         = prepareChunkInfo(false)
-	QueryUploadID          = prepareFindMetaByUploadID()
+	queryChunkInfo             = prepareChunkInfo(false, false)
+	queryChunkInfoWithSize     = prepareChunkInfo(true, false)
+	queryChunkInfoGen          = prepareChunkInfo(false, true)
+	queryChunkInfoWithSizeGen  = prepareChunkInfo(true, true)
+	QueryChunkInfoWithSize     = queryChunkInfoWithSize
+	QueryChunkInfo             = queryChunkInfo
+	QueryUploadID              = prepareFindMetaByUploadID()
 )
 
 // get fields other than the byte payload (data)
-func prepareChunkInfo(size bool) *dsl.Tmpl {
+// when byGeneration is true, the query filters on the upload session
+// generation (upload_id) in addition to the base document id, so chunks left
+// behind by a previous, abandoned session are never returned.
+func prepareChunkInfo(size, byGeneration bool) *dsl.Tmpl {
 	tmpl := dsl.NewTmpl()
 	root := dsl.NewRoot()
 	root.Param("_source", false)
-	root.Query().Term(FieldBaseID, tmpl.Bind(FieldBaseID), nil)
-	root.Param("fields", []string{FieldSHA2, FieldLast, FieldBaseID})
+	must := root.Query().Bool().Must()
+	must.Term(FieldBaseID, tmpl.Bind(FieldBaseID), nil)
+	if byGeneration {
+		must.Term(FieldUploadID, tmpl.Bind(FieldUploadID), nil)
+	}
+	root.Param("fields", []string{FieldSHA2, FieldLast, FieldBaseID, FieldUploadID})
 	if size {
 		root.Param("script_fields", map[string]any{
 			"size": map[string]any{
@@ -92,29 +103,55 @@ func GetInfo(ctx context.Context, bulker bulk.Bulk, indexPattern string, uploadI
 		return Info{}, fmt.Errorf("unable to locate upload record, got %d records, expected 1", len(results))
 	}
 
+	return infoFromHit(results[0])
+}
+
+// GetInfoByDocID retrieves a file Metadata by its deterministic document ID
+// (actionID.agentID) instead of its session upload_id. Used when an upload
+// begin collides with an existing session document.
+func GetInfoByDocID(ctx context.Context, bulker bulk.Bulk, index, docID string) (Info, error) {
+	span, ctx := apm.StartSpan(ctx, "getFileInfoByDocID", "read")
+	defer span.End()
+	out, err := bulker.Read(ctx, index, docID)
+	if err != nil {
+		return Info{}, err
+	}
 	var fi MetaDoc
-	if err := json.Unmarshal(results[0].Source, &fi); err != nil {
+	if err := json.Unmarshal(out, &fi); err != nil {
 		return Info{}, fmt.Errorf("file meta doc parsing error: %w", err)
 	}
+	return infoFromMeta(docID, fi), nil
+}
 
-	// calculate number of chunks required
-	cnt := fi.File.Size / fi.File.ChunkSize
-	if fi.File.Size%fi.File.ChunkSize > 0 {
-		cnt += 1
+func infoFromHit(hit es.HitT) (Info, error) {
+	var fi MetaDoc
+	if err := json.Unmarshal(hit.Source, &fi); err != nil {
+		return Info{}, fmt.Errorf("file meta doc parsing error: %w", err)
 	}
+	return infoFromMeta(hit.ID, fi), nil
+}
 
-	return Info{
-		ID:        fi.UploadID,
-		Source:    fi.Source,
-		AgentID:   fi.AgentID,
-		ActionID:  fi.ActionID,
-		DocID:     results[0].ID,
-		ChunkSize: fi.File.ChunkSize,
-		Total:     fi.File.Size,
-		Count:     int(cnt),
-		Start:     fi.Start,
-		Status:    Status(fi.File.Status),
-	}, nil
+func infoFromMeta(docID string, fi MetaDoc) Info {
+	info := Info{
+		ID:         fi.UploadID,
+		DocID:      docID,
+		Source:     fi.Source,
+		AgentID:    fi.AgentID,
+		ActionID:   fi.ActionID,
+		Namespaces: fi.Namespaces,
+		ChunkSize:  fi.File.ChunkSize,
+		Total:      fi.File.Size,
+		Start:      fi.Start,
+		Status:     Status(fi.File.Status),
+	}
+	if fi.File.ChunkSize > 0 {
+		// calculate number of chunks required (0 for a zero-byte file)
+		info.Count = int((fi.File.Size + fi.File.ChunkSize - 1) / fi.File.ChunkSize)
+	}
+	if fi.TransitHash != nil {
+		info.TransitHash = fi.TransitHash.SHA2
+	}
+	return info
 }
 
 // retrieves a full chunk document, Data included
@@ -131,6 +168,10 @@ func GetChunk(ctx context.Context, bulker bulk.Bulk, indexPattern string, source
 type GetChunkInfoOpt struct {
 	IncludeSize bool
 	RequireHash bool
+	// UploadID restricts results to chunks belonging to this upload session
+	// generation. Empty means no generation filter (e.g. files written by
+	// Kibana, which predate generation-tagged chunks).
+	UploadID string
 }
 
 // Retrieves a subset of chunk document fields, specifically omitting the Data payload (bytes)
@@ -140,13 +181,22 @@ type GetChunkInfoOpt struct {
 func GetChunkInfos(ctx context.Context, bulker bulk.Bulk, index string, baseID string, opt GetChunkInfoOpt) ([]ChunkInfo, error) {
 	span, ctx := apm.StartSpan(ctx, "getChunksInfo", "process")
 	defer span.End()
-	tpl := QueryChunkInfo
-	if opt.IncludeSize {
-		tpl = QueryChunkInfoWithSize
+	tpl := queryChunkInfo
+	switch {
+	case opt.IncludeSize && opt.UploadID != "":
+		tpl = queryChunkInfoWithSizeGen
+	case opt.IncludeSize:
+		tpl = queryChunkInfoWithSize
+	case opt.UploadID != "":
+		tpl = queryChunkInfoGen
 	}
-	query, err := tpl.Render(map[string]any{
+	params := map[string]any{
 		FieldBaseID: baseID,
-	})
+	}
+	if opt.UploadID != "" {
+		params[FieldUploadID] = opt.UploadID
+	}
+	query, err := tpl.Render(params)
 	if err != nil {
 		return nil, err
 	}
@@ -161,11 +211,12 @@ func GetChunkInfos(ctx context.Context, bulker bulk.Bulk, index string, baseID s
 	chunks := make([]ChunkInfo, len(res.Hits))
 
 	var (
-		bid  string
-		last bool
-		sha2 string
-		size int
-		ok   bool
+		bid      string
+		last     bool
+		sha2     string
+		uploadID string
+		size     int
+		ok       bool
 	)
 
 	vSpan, _ := apm.StartSpan(ctx, "validateChunksInfo", "validate")
@@ -182,6 +233,8 @@ func GetChunkInfos(ctx context.Context, bulker bulk.Bulk, index string, baseID s
 		if sha2, ok = getResultsFieldString(h.Fields, FieldSHA2); opt.RequireHash && !ok {
 			return nil, fmt.Errorf("unable to retrieve %s field from chunk document", FieldSHA2)
 		}
+		// generation is optional for older/Kibana-written chunks
+		uploadID, _ = getResultsFieldString(h.Fields, FieldUploadID)
 		if size, ok = getResultsFieldInt(h.Fields, "size"); opt.IncludeSize && !ok {
 			return nil, errors.New("unable to retrieve size from chunk document")
 		}
@@ -191,13 +244,14 @@ func GetChunkInfos(ctx context.Context, bulker bulk.Bulk, index string, baseID s
 			return nil, fmt.Errorf("unable to parse chunk number from id %s: %w", h.ID, err)
 		}
 		chunks[i] = ChunkInfo{
-			Pos:   chunkNum,
-			BID:   bid,
-			Last:  last,
-			SHA2:  sha2,
-			Size:  size,
-			Index: h.Index,
-			ID:    h.ID,
+			Pos:      chunkNum,
+			BID:      bid,
+			Last:     last,
+			SHA2:     sha2,
+			UploadID: uploadID,
+			Size:     size,
+			Index:    h.Index,
+			ID:       h.ID,
 		}
 	}
 

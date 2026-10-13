@@ -451,6 +451,33 @@ func NewHTTPErrResp(err error) HTTPErrResp {
 			},
 		},
 		{
+			uploader.ErrChunkContentConflict,
+			HTTPErrResp{
+				http.StatusConflict,
+				"ErrChunkContentConflict",
+				"chunk content conflicts with an already stored chunk; restart the upload session",
+				zerolog.WarnLevel,
+			},
+		},
+		{
+			uploader.ErrSessionConflict,
+			HTTPErrResp{
+				http.StatusConflict,
+				"ErrSessionConflict",
+				"an upload session already exists for this action and agent with different pinned attributes",
+				zerolog.InfoLevel,
+			},
+		},
+		{
+			uploader.ErrUncertainPublish,
+			HTTPErrResp{
+				http.StatusServiceUnavailable,
+				"ErrUploadPublishUncertain",
+				"upload finalization is being confirmed, retry the complete request",
+				zerolog.WarnLevel,
+			},
+		},
+		{
 			uploader.ErrPayloadRequired,
 			HTTPErrResp{
 				http.StatusBadRequest,

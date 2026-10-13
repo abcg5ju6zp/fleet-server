@@ -21,17 +21,18 @@ func TestChunkWriter(t *testing.T) {
 	chunkLength := 9
 	body := io.NopCloser(bytes.NewReader(contents))
 
-	w := NewChunkWriter(body, false, "foobar", "56ab", int64(chunkLength))
+	w := NewChunkWriter(body, false, "foobar", "up123", "56ab", int64(chunkLength))
 
 	outbuf, err := io.ReadAll(w)
 	require.NoError(t, err)
 
 	expected := []byte{
-		0xA5,                                                   // object with 5 keys
+		0xA6,                                                   // object with 6 keys
 		0x6A, '@', 't', 'i', 'm', 'e', 's', 't', 'a', 'm', 'p', // "@timestamp"
 		0x1B, 0, 0, 0, 0, 0, 0, 0, 0, // 8-byte uint64, placeholder 0's
 		0x64, 'l', 'a', 's', 't', 0xF4, // last: false
 		0x63, 'b', 'i', 'd', 0x78, 0x06, 'f', 'o', 'o', 'b', 'a', 'r', // "bid": "foobar"
+		0x69, 'u', 'p', 'l', 'o', 'a', 'd', '_', 'i', 'd', 0x78, 0x05, 'u', 'p', '1', '2', '3', // "upload_id": "up123"
 		0x64, 's', 'h', 'a', '2', 0x78, 0x04, '5', '6', 'a', 'b', // "sha2": "56ab"
 		0x64, 'd', 'a', 't', 'a', // data:
 		0x5A, 0x00, 0x00, 0x00, uint8(chunkLength), // 4-byte length instruction, then the actual 4-byte big-endian length
@@ -50,17 +51,18 @@ func TestChunkWriterLastChunk(t *testing.T) {
 	chunkLength := 20 // describes what a "full" chunk length is, not THIS chunk
 	body := io.NopCloser(bytes.NewReader(contents))
 
-	w := NewChunkWriter(body, true, "foobar", "face", int64(chunkLength))
+	w := NewChunkWriter(body, true, "foobar", "up123", "face", int64(chunkLength))
 
 	outbuf, err := io.ReadAll(w)
 	require.NoError(t, err)
 
 	expected := []byte{
-		0xA5,                                                   // object with 5 keys
+		0xA6,                                                   // object with 6 keys
 		0x6A, '@', 't', 'i', 'm', 'e', 's', 't', 'a', 'm', 'p', // "@timestamp"
 		0x1B, 0, 0, 0, 0, 0, 0, 0, 0, // 8-byte uint64, placeholder 0's
 		0x64, 'l', 'a', 's', 't', 0xF5, // last: true
 		0x63, 'b', 'i', 'd', 0x78, 0x06, 'f', 'o', 'o', 'b', 'a', 'r', // "bid": "foobar"
+		0x69, 'u', 'p', 'l', 'o', 'a', 'd', '_', 'i', 'd', 0x78, 0x05, 'u', 'p', '1', '2', '3', // "upload_id": "up123"
 		0x64, 's', 'h', 'a', '2', 0x78, 0x04, 'f', 'a', 'c', 'e', // "sha2": "face"
 		0x64, 'd', 'a', 't', 'a', // data:
 		0x5F, // indeterminate length sequence
@@ -98,17 +100,18 @@ func TestChunkWriterLargeLastChunk(t *testing.T) {
 	chunkLength := 8192 // describes what a "full" chunk length is, not THIS chunk
 	body := io.NopCloser(bytes.NewReader(contents))
 
-	w := NewChunkWriter(body, true, "foobar", "face", int64(chunkLength))
+	w := NewChunkWriter(body, true, "foobar", "up123", "face", int64(chunkLength))
 
 	outbuf, err := io.ReadAll(w)
 	require.NoError(t, err)
 
 	expected := []byte{
-		0xA5,                                                   // object with 5 keys
+		0xA6,                                                   // object with 6 keys
 		0x6A, '@', 't', 'i', 'm', 'e', 's', 't', 'a', 'm', 'p', // "@timestamp"
 		0x1B, 0, 0, 0, 0, 0, 0, 0, 0, // 8-byte uint64, placeholder 0's
 		0x64, 'l', 'a', 's', 't', 0xF5, // last: true
 		0x63, 'b', 'i', 'd', 0x78, 0x06, 'f', 'o', 'o', 'b', 'a', 'r', // "bid": "foobar"
+		0x69, 'u', 'p', 'l', 'o', 'a', 'd', '_', 'i', 'd', 0x78, 0x05, 'u', 'p', '1', '2', '3', // "upload_id": "up123"
 		0x64, 's', 'h', 'a', '2', 0x78, 0x04, 'f', 'a', 'c', 'e', // "sha2": "face"
 		0x64, 'd', 'a', 't', 'a', // data:
 		0x5F, // indeterminate length sequence

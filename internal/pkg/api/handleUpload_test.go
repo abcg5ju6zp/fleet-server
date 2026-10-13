@@ -74,7 +74,7 @@ func TestUploadBeginValidation(t *testing.T) {
 				"src": "agent"
 			}`,
 		},
-		{"zero size file should be rejected", http.StatusBadRequest, "size",
+		{"zero size file is accepted", http.StatusOK, "",
 			`{
 				"file": {
 					"size": 0,
@@ -365,7 +365,7 @@ func TestUploadBeginFileSize(t *testing.T) {
 	}{
 		{"MaxSize nil allows uploads", nil, http.StatusOK, 1000},
 		{"MaxSize nil allows large uploads", nil, http.StatusOK, 1024 * 1024 * 1024 * 2},
-		{"MaxSize nil does not allow 0-length files", nil, http.StatusBadRequest, 0},
+		{"MaxSize nil allows 0-length files", nil, http.StatusOK, 0},
 		{"MaxSize 0 does not allow uploads", size_ptr(0), http.StatusForbidden, 1000},
 		{"MaxSize 0 does not allow 0-sized uploads", size_ptr(0), http.StatusForbidden, 0},
 		{"Sizes larger than MaxSize are denied", size_ptr(1024), http.StatusBadRequest, 2048},
@@ -555,7 +555,7 @@ func TestChunkUploadStatus(t *testing.T) {
 		{"Can upload for Status Awaiting", file.StatusAwaiting, http.StatusOK, ""},
 		{"Can upload for in progress", file.StatusProgress, http.StatusOK, ""},
 		{"Status Delete Files cannot upload", file.StatusDel, http.StatusBadRequest, "stopped"},
-		{"Status Complete File cannot upload", file.StatusDone, http.StatusBadRequest, "stopped"},
+		{"Status Complete File still accepts idempotent chunk retries", file.StatusDone, http.StatusOK, ""},
 		{"Status Failure File cannot upload", file.StatusFail, http.StatusBadRequest, "stopped"},
 	}
 
@@ -678,6 +678,94 @@ func TestChunkUploadWritesTimestamp(t *testing.T) {
 	req.Header.Set("X-Chunk-SHA2", hash)
 
 	hr.ServeHTTP(rec, req)
+}
+
+/*
+	Upload finalization route testing
+*/
+
+// A chunk whose bytes do not match the declared hash is rejected before
+// anything is written to Elasticsearch.
+func TestChunkUploadRejectsMismatchedHashBeforeWrite(t *testing.T) {
+	data := []byte("filedata")
+	mockUploadID := "abc123"
+
+	hr, _, fakebulk, mtx := prepareUploaderMock(t)
+	mockUploadInfoResult(fakebulk, file.Info{
+		DocID:     "bar.foo",
+		ID:        mockUploadID,
+		ChunkSize: file.MaxChunkSize,
+		Total:     10,
+		Count:     1,
+		Start:     time.Now(),
+		Status:    file.StatusAwaiting,
+		Source:    "agent",
+		AgentID:   "foo",
+		ActionID:  "bar",
+	})
+
+	createCalled := false
+	mtx.RoundTripFn = func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.URL.Path, "/_create") {
+			createCalled = true
+		}
+		return sendBodyString("{}"), nil
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/api/fleet/uploads/"+mockUploadID+"/0", bytes.NewReader(data))
+	req.Header.Set("X-Chunk-SHA2", "0000000000000000000000000000000000000000000000000000000000000000")
+	hr.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "hash does not match")
+	assert.False(t, createCalled, "a hash-mismatched chunk must not be indexed")
+}
+
+// A retried chunk PUT that collides in Elasticsearch but carries the same
+// content hash succeeds (200) as an idempotent retry.
+func TestChunkUploadIdempotentRetry(t *testing.T) {
+	data := []byte("filedata")
+	hasher := sha256.New()
+	_, err := hasher.Write(data)
+	require.NoError(t, err)
+	hash := hex.EncodeToString(hasher.Sum(nil))
+	mockUploadID := "abc123"
+
+	hr, _, fakebulk, mtx := prepareUploaderMock(t)
+	mockUploadInfoResult(fakebulk, file.Info{
+		DocID:     "bar.foo",
+		ID:        mockUploadID,
+		ChunkSize: file.MaxChunkSize,
+		Total:     10,
+		Count:     1,
+		Start:     time.Now(),
+		Status:    file.StatusProgress,
+		Source:    "agent",
+		AgentID:   "foo",
+		ActionID:  "bar",
+	})
+
+	mtx.RoundTripFn = func(req *http.Request) (*http.Response, error) {
+		resp := sendBodyString(`{"error":{"type":"version_conflict_engine_exception"}}`)
+		resp.StatusCode = http.StatusConflict
+		return resp, nil
+	}
+
+	// the stored chunk carries the same hash as the retried bytes
+	fakebulk.On("Read", mock.Anything, mock.MatchedBy(func(idx string) bool {
+		return strings.HasPrefix(idx, ".fleet-fileds-fromhost-data-")
+	}), mock.Anything, mock.Anything).Return(mustJSON(t, file.Chunk{
+		BID:  "bar.foo",
+		SHA2: hash,
+	}), nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/api/fleet/uploads/"+mockUploadID+"/0", bytes.NewReader(data))
+	req.Header.Set("X-Chunk-SHA2", hash)
+	hr.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
 /*
@@ -1168,6 +1256,14 @@ func configureUploaderMock(t *testing.T, fileSize *uint64) (http.Handler, apiSer
 	// chunk index operations skip the bulker in order to send binary docs directly
 	// so a mock *elasticsearch.Client needs to be be prepared
 	es, tx := mockESClient(t)
+	// raw ES metadata updates (publish/fail/delete status) report "updated"
+	tx.RoundTripFn = func(req *http.Request) (*http.Response, error) {
+		body := "{}"
+		if strings.Contains(req.URL.Path, "/_update/") {
+			body = `{"result":"updated"}`
+		}
+		return sendBodyString(body), nil
+	}
 
 	fakebulk := itesting.NewMockBulk()
 	fakebulk.On("Create",
@@ -1369,6 +1465,13 @@ func sendBody(body io.Reader) *http.Response {
 func size_ptr(x int) *uint64 {
 	y := uint64(x) //nolint:gosec // disable G115
 	return &y
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return b
 }
 
 func generateLargePayload(paddingSize int) string {

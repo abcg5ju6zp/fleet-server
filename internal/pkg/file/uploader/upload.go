@@ -14,6 +14,7 @@ import (
 
 	"github.com/elastic/fleet-server/v7/internal/pkg/bulk"
 	"github.com/elastic/fleet-server/v7/internal/pkg/cache"
+	"github.com/elastic/fleet-server/v7/internal/pkg/es"
 	"github.com/elastic/fleet-server/v7/internal/pkg/file"
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/gofrs/uuid/v5"
@@ -36,7 +37,17 @@ var (
 	ErrFieldRequired    = errors.New("field required")
 
 	ErrPayloadSizeTooLarge = errors.New("payload size too large")
+
+	// ErrChunkContentConflict is returned when a chunk PUT collides with an
+	// existing chunk at the same position that has a different content hash.
+	// The confirmed chunk is preserved and the incoming content is isolated.
+	ErrChunkContentConflict = errors.New("chunk content conflicts with an existing chunk at this position")
+	// ErrSessionConflict is returned when an upload begin collides with an
+	// existing session but the pinned file attributes (e.g. size) differ.
+	ErrSessionConflict = errors.New("an upload session already exists with different file attributes")
 )
+
+const fieldFile = "file"
 
 type Uploader struct {
 	cache     cache.Cache // cache of file metadata doc info
@@ -57,7 +68,24 @@ func New(chunkClient *elasticsearch.Client, bulker bulk.Bulk, cache cache.Cache,
 	}
 }
 
-// Start an upload operation
+// DefaultUploadLifetime is the maximum lifetime of an unfinished upload
+// session. After this period without finalization the session expires: chunk
+// PUTs are rejected and garbage collection may reclaim the session's chunks.
+const DefaultUploadLifetime = 24 * time.Hour
+
+// Begin an upload operation.
+//
+// The session pins the agent, action, namespaces, source integration (data
+// index), file size and the session generation (upload_id). The metadata
+// document ID is deterministic (actionID.agentID), so a retried begin request
+// is idempotent:
+//   - an active, reusable session is returned unchanged,
+//   - a published session is returned (chunk and complete retries stay
+//     idempotent),
+//   - an expired, failed or deleted session is superseded by a fresh
+//     generation, replacing the metadata document. Reclaiming the previous
+//     generation's chunks is always scoped by generation, so it never affects
+//     the new session.
 func (u *Uploader) Begin(ctx context.Context, namespaces []string, data JSDict) (file.Info, error) {
 	if u.sizeLimit != nil && *u.sizeLimit == 0 {
 		return file.Info{}, ErrFeatureDisabled
@@ -79,7 +107,7 @@ func (u *Uploader) Begin(ctx context.Context, namespaces []string, data JSDict) 
 		return file.Info{}, err
 	}
 
-	size, _ := data.Int64("file", "size")
+	size, _ := data.Int64(fieldFile, "size")
 	if u.sizeLimit != nil && uint64(size) > *u.sizeLimit { //nolint:gosec // disable G115 - negatives are checked for in payload validation
 		vSpan.End()
 		return file.Info{}, ErrFileSizeTooLarge
@@ -98,6 +126,27 @@ func (u *Uploader) Begin(ctx context.Context, namespaces []string, data JSDict) 
 	source, _ := data.Str("src")
 	docID := fmt.Sprintf("%s.%s", actionID, agentID)
 
+	info := newSessionInfo(id, docID, agentID, actionID, source, namespaces, size)
+
+	doc, err := buildSessionDoc(data, info)
+	if err != nil {
+		return file.Info{}, err
+	}
+
+	if _, err := CreateFileDoc(ctx, u.bulker, doc, source, docID); err != nil {
+		if errors.Is(err, es.ErrElasticVersionConflict) {
+			// a deterministic document ID is already in use: either an
+			// idempotent retry, or a previous session that must be superseded
+			return u.beginExistingSession(ctx, data, docID, size, info)
+		}
+		return file.Info{}, err
+	}
+
+	u.cache.SetUpload(id, info)
+	return info, nil
+}
+
+func newSessionInfo(id, docID, agentID, actionID, source string, namespaces []string, size int64) file.Info {
 	info := file.Info{
 		ID:         id,
 		DocID:      docID,
@@ -110,48 +159,81 @@ func (u *Uploader) Begin(ctx context.Context, namespaces []string, data JSDict) 
 		Status:     file.StatusAwaiting,
 		Start:      time.Now(),
 	}
-	chunkCount := info.Total / info.ChunkSize
-	if info.Total%info.ChunkSize > 0 {
+	chunkCount := size / info.ChunkSize
+	if size%info.ChunkSize > 0 {
 		chunkCount += 1
 	}
 	info.Count = int(chunkCount)
+	return info
+}
 
-	/*
-		Enrich document with additional server-side fields
-	*/
+// buildSessionDoc enriches the client-provided payload with the server-side
+// fields of the pinned session and serializes it.
+func buildSessionDoc(data JSDict, info file.Info) ([]byte, error) {
+	for _, put := range []struct {
+		value any
+		path  []string
+	}{
+		{info.ChunkSize, []string{fieldFile, "ChunkSize"}},
+		{info.Status, []string{fieldFile, "Status"}},
+		{info.ID, []string{"upload_id"}},
+		{info.Start.UnixMilli(), []string{"upload_start"}},
+		{info.Start.UnixMilli(), []string{"@timestamp"}},
+		{info.Namespaces, []string{"namespaces"}},
+	} {
+		if err := data.Put(put.value, put.path...); err != nil {
+			return nil, err
+		}
+	}
+	return json.Marshal(data)
+}
 
-	if err := data.Put(info.ChunkSize, "file", "ChunkSize"); err != nil {
-		return file.Info{}, err
-	}
-	if err := data.Put(info.Status, "file", "Status"); err != nil {
-		return file.Info{}, err
-	}
-	if err := data.Put(id, "upload_id"); err != nil {
-		return file.Info{}, err
-	}
-	if err := data.Put(info.Start.UnixMilli(), "upload_start"); err != nil {
-		return file.Info{}, err
-	}
-	if err := data.Put(info.Start.UnixMilli(), "@timestamp"); err != nil {
-		return file.Info{}, err
-	}
-	if err := data.Put(info.Namespaces, "namespaces"); err != nil {
-		return file.Info{}, err
-	}
-
-	/*
-		Write to storage
-	*/
-	doc, err := json.Marshal(data)
+// beginExistingSession resolves a collision on the deterministic metadata
+// document ID, either reusing the existing session or superseding it with the
+// freshly generated session in info.
+func (u *Uploader) beginExistingSession(ctx context.Context, data JSDict, docID string, size int64, info file.Info) (file.Info, error) {
+	source := info.Source
+	existing, err := file.GetInfoByDocID(ctx, u.bulker, fmt.Sprintf(UploadHeaderIndexPattern, source), docID)
 	if err != nil {
 		return file.Info{}, err
 	}
-	_, err = CreateFileDoc(ctx, u.bulker, doc, source, docID)
+
+	// Pinned attributes must match. The document ID already binds agent and
+	// action; reject a session reuse with a different file size rather than
+	// silently mixing chunks of two different files.
+	if existing.Total != size || existing.Source != source ||
+		existing.AgentID != info.AgentID || existing.ActionID != info.ActionID {
+		return file.Info{}, ErrSessionConflict
+	}
+
+	if existing.Published() || sessionReusable(existing, u.timeLimit) {
+		// Idempotent retry: return the original session. Agents may re-send
+		// chunks and complete; both remain idempotent.
+		u.cache.SetUpload(existing.ID, existing)
+		return existing, nil
+	}
+
+	// Previous session expired, failed or was deleted: start a new generation
+	// under the same document ID. The new upload_id generation ensures old
+	// in-flight chunks and stale cleanup tasks cannot touch the new session.
+	doc, err := buildSessionDoc(data, info)
 	if err != nil {
 		return file.Info{}, err
 	}
-
+	if _, err := ReplaceFileDoc(ctx, u.bulker, doc, source, docID); err != nil {
+		return file.Info{}, err
+	}
+	u.cache.SetUpload(info.ID, info)
 	return info, nil
+}
+
+// sessionReusable reports whether an unfinished session may accept more
+// chunk writes and a complete request.
+func sessionReusable(info file.Info, timeLimit time.Duration) bool {
+	if info.Status == file.StatusFail || info.Status == file.StatusDel {
+		return false
+	}
+	return !info.Expired(timeLimit)
 }
 
 func (u *Uploader) Chunk(ctx context.Context, uplID string, chunkNum int, chunkHash string) (file.Info, file.ChunkInfo, error) {
@@ -165,30 +247,31 @@ func (u *Uploader) Chunk(ctx context.Context, uplID string, chunkNum int, chunkH
 		Verify Chunk upload can proceed
 	*/
 
-	if info.Expired(u.timeLimit) {
+	if !info.StatusCanUploadChunks(u.timeLimit) {
+		if info.Status == file.StatusFail || info.Status == file.StatusDel {
+			return file.Info{}, file.ChunkInfo{}, ErrUploadStopped
+		}
 		return file.Info{}, file.ChunkInfo{}, ErrUploadExpired
 	}
-	if !info.StatusCanUpload() {
-		return file.Info{}, file.ChunkInfo{}, ErrUploadStopped
-	}
-	if chunkNum < 0 || chunkNum >= info.Count {
+	if info.Count == 0 || chunkNum < 0 || chunkNum >= info.Count {
 		return file.Info{}, file.ChunkInfo{}, ErrInvalidChunkNum
 	}
 
 	return info, file.ChunkInfo{
-		Pos:  chunkNum,
-		BID:  info.DocID,
-		Last: chunkNum == info.Count-1,
-		Size: int(info.ChunkSize),
-		SHA2: chunkHash,
+		Pos:      chunkNum,
+		BID:      info.DocID,
+		UploadID: info.ID,
+		Last:     chunkNum == info.Count-1,
+		Size:     int(info.ChunkSize),
+		SHA2:     chunkHash,
 	}, nil
 }
 
 func validateUploadPayload(info JSDict) error {
 
 	required := [][]string{
-		{"file", "name"},
-		{"file", "mime_type"},
+		{fieldFile, "name"},
+		{fieldFile, "mime_type"},
 		{"action_id"},
 		{"agent_id"},
 		{"src"},
@@ -200,9 +283,10 @@ func validateUploadPayload(info JSDict) error {
 		}
 	}
 
-	if size, ok := info.Int64("file", "size"); !ok {
+	// zero-byte files are valid; only a missing or negative size is rejected
+	if size, ok := info.Int64(fieldFile, "size"); !ok {
 		return ErrFileSizeRequired
-	} else if size <= 0 {
+	} else if size < 0 {
 		return fmt.Errorf("file.size: %d: %w", size, ErrInvalidFileSize)
 	}
 	return nil
