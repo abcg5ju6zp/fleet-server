@@ -35,7 +35,7 @@ const weightedCapacity int64 = 10000
 // exact weight and contention/reclaim behaves like the unit-slot kernel.
 func TestWeightedAcquireAndReclaim(t *testing.T) {
 	clk := newFakeClock()
-	r := New(weightedConfig(10000), WithClock(clk))
+	r := New(weightedConfig(), WithClock(clk))
 
 	la, err := r.TryAcquireN(ResourceCacheCost, "a", 6000)
 	require.NoError(t, err)
@@ -80,7 +80,7 @@ func TestWeightedAcquireAndReclaim(t *testing.T) {
 
 // Weighted releases subtract exactly the claimed weight.
 func TestWeightedLeaseRelease(t *testing.T) {
-	r := New(weightedConfig(10000))
+	r := New(weightedConfig())
 
 	l, err := r.TryAcquireN(ResourceCacheCost, "a", 3000)
 	require.NoError(t, err)
@@ -94,7 +94,7 @@ func TestWeightedLeaseRelease(t *testing.T) {
 // capacity-sized head room when the pool is otherwise empty, matching the
 // cache's treatment of oversized entries; the lease keeps its true weight.
 func TestWeightedOversizedAdmission(t *testing.T) {
-	r := New(weightedConfig(10000))
+	r := New(weightedConfig())
 
 	l, err := r.TryAcquireN(ResourceCacheCost, "a", 15000)
 	require.NoError(t, err)
@@ -113,7 +113,7 @@ func TestWeightedOversizedAdmission(t *testing.T) {
 
 // Zero-weight admissions are untracked no-ops.
 func TestWeightedZeroIsNoop(t *testing.T) {
-	r := New(weightedConfig(10000))
+	r := New(weightedConfig())
 
 	l, err := r.TryAcquireN(ResourceCacheCost, tenant.Default, 0)
 	require.NoError(t, err)

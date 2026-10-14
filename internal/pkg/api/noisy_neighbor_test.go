@@ -282,9 +282,9 @@ func TestNoisyNeighborAcrossHTTPResources(t *testing.T) {
 	}
 }
 
-func checkinInUse(reg *budget.Registry, owner tenant.Owner) int64 {
+func ownerInUse(reg *budget.Registry, res budget.Resource, owner tenant.Owner) int64 {
 	for _, rs := range reg.Snapshot().Resource {
-		if rs.Resource != budget.ResourceCheckin {
+		if rs.Resource != res {
 			continue
 		}
 		for _, os := range rs.Owners {
